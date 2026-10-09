@@ -1,5 +1,5 @@
 services:
-  whatsapp-ha-bot:
+  whatsapp-ha-bridge:
     image: ghcr.io/mirci212/whatsapp-bridge-homeassisant:latest
     container_name: whatsapp-bridge-homeassisant
     restart: unless-stopped
@@ -13,7 +13,7 @@ services:
       - CONVERSATION_AGENT=conversation.gemini_live
       - ALLOWED_USERS=43***:Marco,43****:Brigitte
     volumes:
-      - ha_bot_auth:/app/auth_info_baileys
+      - ha_bridge_auth:/app/auth_info_baileys
 
 volumes:
-  ha_bot_auth:
+  ha_bridge_auth:
