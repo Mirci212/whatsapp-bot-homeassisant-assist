@@ -43,42 +43,6 @@ const msgRetryCounterCache = new NodeCache();
 
 let sock;
 
-// Hilfsfunktion: Extrahiert die reine Telefonnummer aus der JID
-function extractPhoneNumber(msg) {
-  if (!msg || !msg.key) return "";
-
-  // 1. Primär nach Alternativ-JIDs suchen (Baileys liefert hier oft die @s.whatsapp.net JID, wenn remoteJid eine @lid ist)
-  let rawJid = msg.key.remoteJidAlt || msg.key.participantAlt;
-
-  // 2. Falls keine Alt-JID existiert, die Standard-JIDs prüfen
-  if (!rawJid) {
-    const candidateJid = msg.key.participant || msg.key.remoteJid || "";
-
-    // Wenn die Candidate-JID KEINE LID ist (sondern eine normale Telefonnummer), verwenden wir sie
-    if (!candidateJid.endsWith("@lid")) {
-      rawJid = candidateJid;
-    }
-  }
-
-  // 3. Fallback: Falls es eine LID ist und keine Alt-JID gefunden wurde, im Chat/PushName oder sender-Objekt suchen
-  if (!rawJid) {
-    // Manchmal steckt die echte JID im übergeordneten msg-Objekt (z.B. msg.verifiedBizName oder msg.key.fromMe)
-    rawJid = msg.key.participant || msg.key.remoteJid || "";
-  }
-
-  if (!rawJid) return "";
-
-  // JID normalisieren (entfernt Geräte-Suffixe wie :12@s.whatsapp.net)
-  const normalizedJid = jidNormalizedUser(rawJid);
-  const phoneNumber = normalizedJid
-    .split("@")[0]
-    .split(":")[0]
-    .replace(/[^0-9]/g, "")
-    .toLowerCase();
-
-  return phoneNumber;
-}
-
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(
     "./auth_info_baileys",
