@@ -9,9 +9,9 @@ const qrcode = require("qrcode-terminal");
 const express = require("express");
 const NodeCache = require("node-cache");
 try {
-  require("dotenv").config();
+    require("dotenv").config({ override: false });
 } catch (e) {
-  // In Docker/Portainer ist dotenv nicht nötig, da process.env vom Container kommt
+    // In Docker/Portainer werden die Variablen direkt vom Container bereitgestellt
 }
 
 const HA_URL = process.env.HA_URL || "http://192.168.0.2:8123";
