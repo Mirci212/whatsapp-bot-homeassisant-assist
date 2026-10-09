@@ -8,6 +8,8 @@ const axios = require("axios");
 const qrcode = require("qrcode-terminal");
 const express = require("express");
 const NodeCache = require("node-cache");
+const fs = require("fs");
+const path = require("path");
 
 try {
   require("dotenv").config({ override: false });
@@ -31,7 +33,7 @@ const USER_NAMES = (process.env.USER_MAPPING || "")
   .map((name) => name.trim().toLowerCase())
   .filter(Boolean);
 
-// Dynamisches Adressbuch aufbauen (z.B. marco -> 436601234567)
+// Dynamisches Adressbuch aufbauen (z.B. marco -> 436505803032)
 const ADDRESS_BOOK = {};
 USER_NAMES.forEach((name, index) => {
   if (ALLOWED_USERS[index]) {
@@ -39,13 +41,56 @@ USER_NAMES.forEach((name, index) => {
   }
 });
 
-// Optionales LID-Mapping aus ENV (Format: LID1:NUMMER1,LID2:NUMMER2)
+// Statisches LID-Mapping aus ENV (Format: LID1:NUMMER1,LID2:NUMMER2)
 const LID_MAPPING = {};
 if (process.env.LID_MAPPING) {
   process.env.LID_MAPPING.split(",").forEach((pair) => {
     const [lid, num] = pair.split(":");
     if (lid && num) LID_MAPPING[lid.trim()] = num.trim();
   });
+}
+
+// -------------------------------------------------------------
+// Persistent LID-Cache System (im Auth-Volume speichern)
+// -------------------------------------------------------------
+const LID_CACHE_FILE = path.join(__dirname, "auth_info_baileys", "lid_cache.json");
+const autoLidMap = {};
+
+// Cache beim Start aus der Datei laden
+if (fs.existsSync(LID_CACHE_FILE)) {
+  try {
+    const savedLids = JSON.parse(fs.readFileSync(LID_CACHE_FILE, "utf-8"));
+    Object.assign(autoLidMap, savedLids);
+    console.log("[LID-Cache] Erfolgreich aus Volume geladen:", autoLidMap);
+  } catch (e) {
+    console.error("[LID-Cache] Fehler beim Laden der Cache-Datei:", e.message);
+  }
+}
+
+// Speichert den aktuellen Stand von autoLidMap in das Volume
+function saveLidCache() {
+  try {
+    const dir = path.dirname(LID_CACHE_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(LID_CACHE_FILE, JSON.stringify(autoLidMap, null, 2));
+  } catch (e) {
+    console.error("[LID-Cache] Fehler beim Speichern:", e.message);
+  }
+}
+
+// Hilfsfunktion zum Hinzufügen einer LID ins Cache-System
+function registerLidMapping(lid, phone) {
+  if (!lid || !phone) return;
+  const cleanLid = lid.split("@")[0].split(":")[0];
+  const cleanPhone = phone.split("@")[0].split(":")[0].replace(/[^0-9]/g, "");
+
+  if (cleanLid && cleanPhone && autoLidMap[cleanLid] !== cleanPhone) {
+    autoLidMap[cleanLid] = cleanPhone;
+    saveLidCache();
+    console.log(`[LID-Cache] Neue Verknüpfung gespeichert: LID (${cleanLid}) -> Nummer (${cleanPhone})`);
+  }
 }
 
 // Cache für Nachricht-Wiederholungen gegen Entschlüsselungsfehler
@@ -68,12 +113,17 @@ async function getPhoneNumberFromJid(keys, rawJid) {
   if (rawJid.endsWith("@lid")) {
     const lidId = rawJid.split("@")[0].split(":")[0];
 
-    // Im optionalen LID-Mapping nachschlagen
+    // a) Im persistenten Auto-LID-Map nachsehen
+    if (autoLidMap[lidId]) {
+      return autoLidMap[lidId];
+    }
+
+    // b) Im manuellen ENV-Mapping nachsehen
     if (LID_MAPPING[lidId]) {
       return LID_MAPPING[lidId];
     }
 
-    // Versuchen, das Mapping aus dem Baileys Session-Store zu lesen
+    // c) Versuchen, das Mapping aus dem Baileys Session-Store zu lesen
     try {
       if (keys && typeof keys.get === "function") {
         const lidMap = await keys.get("lid-mapping", [lidId]);
@@ -82,7 +132,7 @@ async function getPhoneNumberFromJid(keys, rawJid) {
         }
       }
     } catch (err) {
-      // Fallback ignorieren
+      // Ignorieren falls nicht gefunden
     }
 
     return lidId;
@@ -100,10 +150,27 @@ async function startBot() {
     auth: state,
     printQRInTerminal: true,
     msgRetryCounterCache,
-    syncFullHistory: false,
+    syncFullHistory: true, // Für den Kontakt-Sync auf true belassen
   });
 
   sock.ev.on("creds.update", saveCreds);
+
+  // Automatische Kontakt- & LID-Synchronisierung abfangen und im Volume speichern
+  sock.ev.on("contacts.upsert", (contacts) => {
+    for (const contact of contacts) {
+      if (contact.lid && contact.id) {
+        registerLidMapping(contact.lid, contact.id);
+      }
+    }
+  });
+
+  sock.ev.on("contacts.update", (updates) => {
+    for (const update of updates) {
+      if (update.lid && update.id) {
+        registerLidMapping(update.lid, update.id);
+      }
+    }
+  });
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -118,6 +185,15 @@ async function startBot() {
       console.log("Verbindung getrennt. Reconnect:", shouldReconnect);
       if (shouldReconnect) startBot();
     } else if (connection === "open") {
+      // Eigene LID und Nummer aus der aktiven WhatsApp-Session registrieren & im Volume speichern
+      if (sock.user) {
+        const myNum = sock.user.id;
+        const myLid = sock.user.lid;
+        if (myLid && myNum) {
+          registerLidMapping(myLid, myNum);
+        }
+      }
+
       console.log("WhatsApp Bot ist erfolgreich verbunden!");
       console.log("Erlaubte Nummern:", ALLOWED_USERS);
       console.log("Namens-Mapping:", ADDRESS_BOOK);
@@ -129,7 +205,7 @@ async function startBot() {
     for (const msg of m.messages) {
       if (msg.key.fromMe) continue;
 
-      // 1. Alt-JIDs bevorzugen (Baileys speichert dort oft die echte Handy-JID)
+      // 1. Alt-JIDs bevorzugen
       let rawJid =
         msg.key.remoteJidAlt ||
         msg.key.participantAlt ||
@@ -137,7 +213,7 @@ async function startBot() {
         msg.key.remoteJid ||
         "";
 
-      // 2. Nummer/LID auflösen (state.keys wird korrekt übergeben)
+      // 2. Nummer/LID auflösen
       let senderNumber = await getPhoneNumberFromJid(state.keys, rawJid);
 
       // Falls immer noch eine Alt-JID mit Mobilnummer existiert
@@ -149,10 +225,24 @@ async function startBot() {
       // Suffixe und Sonderzeichen entfernen
       senderNumber = senderNumber.replace(/[^0-9]/g, "");
 
-      // 3. Empfänger-JID für die Antwort bestimmen
+      const pushName = msg.pushName || "Unbekannt";
+
+      // 3. PushName Fallback (falls die LID neu & noch nicht im Volume gespeichert war)
+      if (senderNumber.length > 13 && pushName !== "Unbekannt") {
+        const cleanPushName = pushName.toLowerCase().trim();
+        if (ADDRESS_BOOK[cleanPushName]) {
+          const matchedNumber = ADDRESS_BOOK[cleanPushName];
+          // Verknüpfung direkt im Volume speichern, damit es ab jetzt dauerhaft bekannt ist
+          registerLidMapping(rawJid, matchedNumber);
+          senderNumber = matchedNumber;
+          console.log(`[PushName-Fallback] LID für ${pushName} als ${senderNumber} aufgelöst und im Volume gespeichert.`);
+        }
+      }
+
+      // 4. Empfänger-JID für die Antwort bestimmen
       const senderJid = msg.key.remoteJid;
 
-      // 4. Nachrichtentext extrahieren
+      // 5. Nachrichtentext extrahieren
       const text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
@@ -161,11 +251,9 @@ async function startBot() {
 
       if (!text) continue; // Keine Textnachricht -> überspringen
 
-      const pushName = msg.pushName || "Unbekannt";
-
       console.log(`Empfangen von Nummer: ${senderNumber}`);
 
-      // 5. Zugriffsprüfung
+      // 6. Zugriffsprüfung
       if (!ALLOWED_USERS.includes(senderNumber)) {
         console.log(`Zugriff verweigert für: ${senderNumber} (Name: ${pushName})`);
         continue;
@@ -175,7 +263,7 @@ async function startBot() {
         `Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`
       );
 
-      // 6. An Home Assistant senden
+      // 7. An Home Assistant senden
       try {
         const payload = {
           text: `[Absender: ${pushName}] ${text}`,
