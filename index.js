@@ -69,9 +69,9 @@ async function startBot() {
             console.log('Verbindung getrennt. Reconnect:', shouldReconnect);
             if (shouldReconnect) startBot();
         } else if (connection === 'open') {
-            console.log('✅ WhatsApp Bot ist erfolgreich verbunden!');
-            console.log('📋 Erlaubte Nummern:', ALLOWED_USERS);
-            console.log('👤 Namens-Mapping:', ADDRESS_BOOK);
+            console.log('WhatsApp Bot ist erfolgreich verbunden!');
+            console.log('Erlaubte Nummern:', ALLOWED_USERS);
+            console.log('Namens-Mapping:', ADDRESS_BOOK);
         }
     });
 
@@ -89,11 +89,11 @@ async function startBot() {
 
         // Berechtigungsprüfung
         if (ALLOWED_USERS.length > 0 && !ALLOWED_USERS.includes(senderNumber)) {
-            console.log(`⛔ Zugriff verweigert für: ${senderNumber} (${pushName})`);
+            console.log(`Zugriff verweigert für: ${senderNumber} (${pushName})`);
             return;
         }
 
-        console.log(`💬 Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`);
+        console.log(`Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`);
 
         try {
             const payload = {
@@ -118,7 +118,7 @@ async function startBot() {
 
         } catch (error) {
             console.error('Fehler bei Home Assistant:', error.response?.data || error.message);
-            await sock.sendMessage(senderJid, { text: "❌ Fehler bei der Verarbeitung in Home Assistant." });
+            await sock.sendMessage(senderJid, { text: "Fehler bei der Verarbeitung in Home Assistant." });
         }
     });
 }
@@ -152,7 +152,7 @@ app.post('/send-message', async (req, res) => {
             if (isNumeric) {
                 targetNumber = cleanRecipient.replace('+', '').trim();
             } else {
-                console.error(`❌ Fehler: Name "${recipient}" wurde im USER_MAPPING nicht gefunden.`);
+                console.error(`Fehler: Name "${recipient}" wurde im USER_MAPPING nicht gefunden.`);
                 return res.status(404).json({ 
                     error: `Name "${recipient}" wurde im USER_MAPPING nicht gefunden.` 
                 });
@@ -162,7 +162,7 @@ app.post('/send-message', async (req, res) => {
         const targetJid = `${targetNumber}@s.whatsapp.net`;
 
         await sock.sendMessage(targetJid, { text: message });
-        console.log(`🔔 Nachricht gesendet an ${recipient} (${targetNumber}): "${message}"`);
+        console.log(`Nachricht gesendet an ${recipient} (${targetNumber}): "${message}"`);
         res.json({ success: true });
 
     } catch (err) {
@@ -172,7 +172,7 @@ app.post('/send-message', async (req, res) => {
 });
 
 app.listen(WEBHOOK_PORT, () => {
-    console.log(`🚀 Webhook-Server läuft auf Port ${WEBHOOK_PORT}`);
+    console.log(`Webhook-Server läuft auf Port ${WEBHOOK_PORT}`);
 });
 
 startBot();
