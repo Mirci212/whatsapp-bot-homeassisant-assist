@@ -1,0 +1,22 @@
+# Lokale Abhängigkeiten und Builds ignorieren
+node_modules
+npm-debug.log
+
+# WhatsApp Auth-Session & WhatsApp Cache (NIEMALS in das Image packen!)
+auth_info_baileys
+*.json.tmp
+
+# Sensible Umgebungsdateien
+.env
+*.env
+muster.env
+
+# Git & GitHub Pipeline-Dateien
+.git
+.gitignore
+.github
+
+# Dokumentation & Nicht-Code Dateien
+README.md
+docker-compose.yaml
+docker-compose.yml

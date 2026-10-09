@@ -1,13 +1,19 @@
 FROM node:20-alpine
 
-# Git und Build-Tools installieren, da Baileys Git benötigt
-RUN apk add --no-cache git
-
+# Arbeitsverzeichnis im Container
 WORKDIR /app
 
+# 1. Nur Package-Dateien kopieren (nutzt Docker Layer Cache optimal)
 COPY package*.json ./
-RUN npm install
 
+# 2. Nur Production-Abhängigkeiten installieren
+RUN npm ci --only=production
+
+# 3. Den eigentlichen Anwendungs-Code kopieren
 COPY . .
 
-CMD ["npm", "start"]
+# Port freigeben
+EXPOSE 3000
+
+# Start-Befehl
+CMD ["node", "index.js"]
