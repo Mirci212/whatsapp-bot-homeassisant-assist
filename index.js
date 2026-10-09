@@ -9,9 +9,9 @@ const qrcode = require("qrcode-terminal");
 const express = require("express");
 const NodeCache = require("node-cache");
 try {
-    require("dotenv").config({ override: false });
+  require("dotenv").config({ override: false });
 } catch (e) {
-    // In Docker/Portainer werden die Variablen direkt vom Container bereitgestellt
+  // In Docker/Portainer werden die Variablen direkt vom Container bereitgestellt
 }
 
 const HA_URL = process.env.HA_URL || "http://192.168.0.2:8123";
@@ -53,7 +53,7 @@ function extractPhoneNumber(msg) {
   // 2. Falls keine Alt-JID existiert, die Standard-JIDs prüfen
   if (!rawJid) {
     const candidateJid = msg.key.participant || msg.key.remoteJid || "";
-    
+
     // Wenn die Candidate-JID KEINE LID ist (sondern eine normale Telefonnummer), verwenden wir sie
     if (!candidateJid.endsWith("@lid")) {
       rawJid = candidateJid;
@@ -70,7 +70,11 @@ function extractPhoneNumber(msg) {
 
   // JID normalisieren (entfernt Geräte-Suffixe wie :12@s.whatsapp.net)
   const normalizedJid = jidNormalizedUser(rawJid);
-  const phoneNumber = normalizedJid.split("@")[0].split(":")[0].replace(/[^0-9]/g, "").toLowerCase();
+  const phoneNumber = normalizedJid
+    .split("@")[0]
+    .split(":")[0]
+    .replace(/[^0-9]/g, "")
+    .toLowerCase();
 
   return phoneNumber;
 }
@@ -110,64 +114,86 @@ async function startBot() {
 
   // 1. EINGEHENDE NACHRICHTEN (WhatsApp -> Home Assistant Assist)
   sock.ev.on("messages.upsert", async (m) => {
-    const msg = m.messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    for (const msg of m.messages) {
+      if (msg.key.fromMe) continue;
 
-    // Verwende remoteJid direkt zum Antworten, damit Baileys die Nachricht an den korrekten Chat-Context zurückschickt
-    const senderJid = msg.key.remoteJid;
-    const senderNumber = extractPhoneNumber(msg);
-    const pushName = (msg.pushName || "Unbekannt").trim();
+      // 1. Ursprüngliche JID ermitteln
+      let rawJid =
+        msg.key.participantAlt ||
+        msg.key.remoteJidAlt ||
+        msg.key.participant ||
+        msg.key.remoteJid ||
+        "";
 
-    const text =
-      msg.message.conversation || msg.message.extendedTextMessage?.text;
-    if (!text) return;
-
-    // Berechtigungsprüfung gegen die extrahierte Nummernliste
-    if (ALLOWED_USERS.length > 0 && !ALLOWED_USERS.includes(senderNumber)) {
-      console.log(
-        `Zugriff verweigert für: ${senderNumber} (ID: ${senderJid}, Name: ${pushName})`,
-      );
-      return;
-    }
-
-    console.log(
-      `Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`,
-    );
-
-    try {
-      const payload = {
-        text: `[Absender: ${pushName}] ${text}`,
-        language: "de",
-      };
-
-      if (CONVERSATION_AGENT) {
-        payload.agent_id = CONVERSATION_AGENT;
+      // 2. Falls es eine @lid ist, frag Baileys intern nach der echten @s.whatsapp.net JID
+      if (rawJid.endsWith("@lid")) {
+        try {
+          // Das Gateway von Sebastian nutzt genau diesen Aufruf:
+          const pnJid = await sock.signalRepository?.lidToJid(rawJid);
+          if (pnJid) {
+            rawJid = pnJid; // Bspw: 436505803032@s.whatsapp.net
+          }
+        } catch (err) {
+          console.error("LID-Auflösung fehlgeschlagen:", err);
+        }
       }
 
-      const haResponse = await axios.post(
-        `${HA_URL}/api/conversation/process`,
-        payload,
-        {
-          headers: {
-            Authorization: `Bearer ${HA_TOKEN}`,
-            "Content-Type": "application/json",
+      // 3. Normalisieren & Telefonnummer extrahieren
+      const normalizedJid = jidNormalizedUser(rawJid);
+      const phoneNumber = normalizedJid
+        .split("@")[0]
+        .split(":")[0]
+        .replace(/[^0-9]/g, "");
+
+      console.log(
+        `Nachricht empfangen von: ${phoneNumber} (Ursprung: ${msg.key.remoteJid})`,
+      );
+
+      // Prüfen
+      if (!ALLOWED_USERS.includes(phoneNumber)) {
+        console.log(`Zugriff verweigert für: ${phoneNumber}`);
+        continue;
+      }
+
+      console.log(
+        `Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`,
+      );
+
+      try {
+        const payload = {
+          text: `[Absender: ${pushName}] ${text}`,
+          language: "de",
+        };
+
+        if (CONVERSATION_AGENT) {
+          payload.agent_id = CONVERSATION_AGENT;
+        }
+
+        const haResponse = await axios.post(
+          `${HA_URL}/api/conversation/process`,
+          payload,
+          {
+            headers: {
+              Authorization: `Bearer ${HA_TOKEN}`,
+              "Content-Type": "application/json",
+            },
           },
-        },
-      );
+        );
 
-      const responseText =
-        haResponse.data?.response?.speech?.plain?.speech ||
-        "Befehl ausgeführt.";
+        const responseText =
+          haResponse.data?.response?.speech?.plain?.speech ||
+          "Befehl ausgeführt.";
 
-      await sock.sendMessage(senderJid, { text: responseText });
-    } catch (error) {
-      console.error(
-        "Fehler bei Home Assistant:",
-        error.response?.data || error.message,
-      );
-      await sock.sendMessage(senderJid, {
-        text: "Fehler bei der Verarbeitung in Home Assistant.",
-      });
+        await sock.sendMessage(senderJid, { text: responseText });
+      } catch (error) {
+        console.error(
+          "Fehler bei Home Assistant:",
+          error.response?.data || error.message,
+        );
+        await sock.sendMessage(senderJid, {
+          text: "Fehler bei der Verarbeitung in Home Assistant.",
+        });
+      }
     }
   });
 }
