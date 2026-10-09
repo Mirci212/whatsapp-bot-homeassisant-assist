@@ -13,7 +13,7 @@ services:
       - CONVERSATION_AGENT=conversation.gemini_live
       - ALLOWED_USERS=43***:Marco,43****:Brigitte
       - STT_ENGINE=stt.faster_whisper
-      - TTS_ENGINE=tts.piper
+      - TTS_ENGINE=tts.gemini_live
     volumes:
       - ha_bridge_auth:/app/auth_info_baileys
 

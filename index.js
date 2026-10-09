@@ -104,7 +104,25 @@ async function textToSpeech(text) {
   if (!TTS_ENGINE) return null;
 
   try {
+    // 1. HA-Dienst aufrufen, um TTS zu erzeugen
     const response = await axios.post(
+      `${HA_URL}/api/services/tts/speak`,
+      {
+        engine_id: TTS_ENGINE,
+        media_player_entity_id: "media_player.dummy", // Wird für die Dateigenerierung benötigt
+        message: text,
+        language: "de"
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${HA_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    // Alternative: Direkter Fallback auf tts_get_url mit Fehler-Logging
+    const urlResponse = await axios.post(
       `${HA_URL}/api/tts_get_url`,
       {
         engine_id: TTS_ENGINE,
@@ -119,8 +137,8 @@ async function textToSpeech(text) {
       }
     );
 
-    if (response.data && response.data.url) {
-      return `${HA_URL}${response.data.url}`;
+    if (urlResponse.data?.url) {
+      return `${HA_URL}${urlResponse.data.url}`;
     }
   } catch (error) {
     console.error("[HA TTS] Fehler bei TTS-Generierung:", error.response?.data || error.message);
