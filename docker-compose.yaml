@@ -1,7 +1,7 @@
 services:
   whatsapp-ha-bot:
-    image: ghcr.io/mirci212/whatsapp-bot-homeassisant-assist:latest
-    container_name: whatsapp_ha_bot
+    image: ghcr.io/mirci212/whatsapp-bridge-homeassisant:latest
+    container_name: whatsapp-bridge-homeassisant
     restart: unless-stopped
     ports:
       - "3000:3000"
@@ -10,9 +10,8 @@ services:
       - PORT=3000
       - HA_URL=http://192.168.0.2:8123
       - HA_TOKEN=dein_long_lived_access_token
-      - CONVERSATION_AGENT=conversation.google_generative_ai
-      - ALLOWED_NUMBERS=43***,43****
-      - USER_MAPPING=marco,brigitte
+      - CONVERSATION_AGENT=conversation.gemini_live
+      - ALLOWED_USERS=43***:Marco,43****:Brigitte
     volumes:
       - ha_bot_auth:/app/auth_info_baileys
 

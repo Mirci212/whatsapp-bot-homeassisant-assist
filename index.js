@@ -2,6 +2,7 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 const axios = require("axios");
 const qrcode = require("qrcode-terminal");
@@ -9,6 +10,7 @@ const express = require("express");
 const NodeCache = require("node-cache");
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
 try {
   require("dotenv").config({ override: false });
@@ -19,6 +21,7 @@ try {
 const HA_URL = process.env.HA_URL || "http://192.168.0.2:8123";
 const HA_TOKEN = process.env.HA_TOKEN;
 const CONVERSATION_AGENT = process.env.CONVERSATION_AGENT || null;
+const STT_ENGINE = process.env.STT_ENGINE || null; // z.B. stt.faster_whisper oder stt.whisper
 const WEBHOOK_PORT = process.env.PORT || 3000;
 
 // -------------------------------------------------------------
@@ -78,7 +81,6 @@ function registerLidMapping(lid, phone) {
   const cleanLid = lid.split("@")[0].split(":")[0];
   const cleanPhone = phone.split("@")[0].split(":")[0].replace(/[^0-9]/g, "");
 
-  // Verhindere das Speichern, wenn phone fälschlicherweise selbst eine LID ist (>13 Stellen)
   if (cleanLid && cleanPhone && cleanPhone.length <= 13 && autoLidMap[cleanLid] !== cleanPhone) {
     autoLidMap[cleanLid] = cleanPhone;
     saveLidCache();
@@ -90,10 +92,70 @@ const msgRetryCounterCache = new NodeCache();
 let sock;
 
 /**
+ * Sendet Sprachnachrichten an den Home Assistant STT Endpoint (Whisper)
+ */
+async function transcribeAudio(msg) {
+  if (!STT_ENGINE) {
+    console.error("[HA STT] Keine STT_ENGINE in .env konfiguriert.");
+    return null;
+  }
+
+  const tmpOggPath = path.join(__dirname, `tmp_${Date.now()}.ogg`);
+  const tmpWavPath = path.join(__dirname, `tmp_${Date.now()}.wav`);
+
+  try {
+    // 1. OGG-Audio aus WhatsApp herunterladen und temporär speichern
+    const buffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { reconnect: async () => true }
+    );
+    fs.writeFileSync(tmpOggPath, buffer);
+
+    // 2. Mit ffmpeg nach WAV konvertieren (16kHz, Mono, 16-bit PCM)
+    execSync(`ffmpeg -y -i "${tmpOggPath}" -ar 16000 -ac 1 -c:a pcm_s16le "${tmpWavPath}"`, {
+      stdio: "ignore",
+    });
+
+    const wavBuffer = fs.readFileSync(tmpWavPath);
+
+    // 3. Konvertiertes WAV an Home Assistant senden
+    const response = await axios.post(
+      `${HA_URL}/api/stt/${STT_ENGINE}`,
+      wavBuffer,
+      {
+        headers: {
+          Authorization: `Bearer ${HA_TOKEN}`,
+          "Content-Type": "audio/wav",
+          "X-Speech-Content": "language=de; format=wav; codec=pcm; sample_rate=16000; bit_rate=16; channel=1",
+        },
+      }
+    );
+
+    if (response.data && response.data.result === "success") {
+      return response.data.text;
+    } else {
+      console.error("[HA STT] Unerwartetes Antwortformat:", response.data);
+      return null;
+    }
+  } catch (error) {
+    console.error(
+      "[HA STT] Fehler bei der Transkription:",
+      error.response?.data || error.message
+    );
+    return null;
+  } finally {
+    // Temporäre Dateien aufräumen
+    if (fs.existsSync(tmpOggPath)) fs.unlinkSync(tmpOggPath);
+    if (fs.existsSync(tmpWavPath)) fs.unlinkSync(tmpWavPath);
+  }
+}
+
+/**
  * Ermittelt aus JID, LID oder Kontaktbuch die Telefonnummer
  */
 async function resolvePhoneNumber(msg, keys) {
-  // 1. WhatsApp Alt-JID / Participant JIDs prüfen
   const possibleJids = [
     msg.key.remoteJidAlt,
     msg.key.participantAlt,
@@ -107,7 +169,6 @@ async function resolvePhoneNumber(msg, keys) {
     }
   }
 
-  // 2. Falls es eine LID ist (@lid)
   const primaryJid = msg.key.remoteJid || "";
   const lidId = primaryJid.split("@")[0].split(":")[0];
 
@@ -115,7 +176,6 @@ async function resolvePhoneNumber(msg, keys) {
     return autoLidMap[lidId];
   }
 
-  // 3. Im Baileys Auth-Key-Store nachsehen (Baileys v6 native LID Storage)
   try {
     if (keys && typeof keys.get === "function") {
       const lidMap = await keys.get("lid-mapping", [lidId]);
@@ -129,7 +189,6 @@ async function resolvePhoneNumber(msg, keys) {
     // Ignorieren falls nicht vorhanden
   }
 
-  // 4. Fallback über PushName matching (falls PushName im Mapping definiert ist)
   if (msg.pushName) {
     const pushNameLower = msg.pushName.trim().toLowerCase();
     if (ADDRESS_BOOK[pushNameLower]) {
@@ -140,7 +199,7 @@ async function resolvePhoneNumber(msg, keys) {
     }
   }
 
-  return lidId; // Rückgabe der rohen ID, falls nicht auflösbar
+  return lidId;
 }
 
 async function startBot() {
@@ -155,9 +214,6 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // -------------------------------------------------------------
-  // Synchronisation aus Adressbuch & Kontakten
-  // -------------------------------------------------------------
   const handleContacts = (contacts) => {
     for (const contact of contacts) {
       if (contact.lid && contact.id) {
@@ -201,11 +257,32 @@ async function startBot() {
       const pushName = msg.pushName || NUMBER_TO_NAME[senderNumber] || "Unbekannt";
       const senderJid = msg.key.remoteJid;
 
-      const text =
+      // 1. Textnachrichten extrahieren (alle Typen)
+      let text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
         msg.message?.imageMessage?.caption ||
+        msg.message?.videoMessage?.caption ||
+        msg.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+        msg.message?.buttonsResponseMessage?.selectedButtonId ||
+        msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
         "";
+
+      // 2. Sprachnachricht verarbeiten, falls kein Text vorhanden ist
+      const isAudio = Boolean(msg.message?.audioMessage);
+      if (!text && isAudio) {
+        console.log(`[Audio empfangen] Verarbeite Sprachnachricht von ${pushName}...`);
+        text = await transcribeAudio(msg);
+
+        if (text) {
+          console.log(`[HA Whisper STT] Transkribiert: "${text}"`);
+        } else {
+          await sock.sendMessage(senderJid, {
+            text: "Fehler: Sprachnachricht konnte nicht transkribiert werden.",
+          });
+          continue;
+        }
+      }
 
       if (!text) continue;
 
@@ -270,7 +347,6 @@ app.post("/send-message", async (req, res) => {
     const cleanRecipient = recipient.toLowerCase().trim();
     let targetNumber = ADDRESS_BOOK[cleanRecipient];
 
-    // Wenn kein Name gematcht wurde, prüfen ob direkt eine Nummer übergeben wurde
     if (!targetNumber) {
       const isNumeric = /^\+?\d+$/.test(cleanRecipient);
       if (isNumeric) {
