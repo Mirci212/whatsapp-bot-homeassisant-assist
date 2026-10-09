@@ -43,6 +43,33 @@ const msgRetryCounterCache = new NodeCache();
 
 let sock;
 
+async function getPhoneNumberFromJid(sock, keys, rawJid) {
+  if (!rawJid) return "";
+
+  // 1. Wenn es bereits eine Phone-Number-JID (@s.whatsapp.net) ist, direkt nutzen
+  if (rawJid.includes("@s.whatsapp.net")) {
+    return rawJid.split("@")[0].split(":")[0];
+  }
+
+  // 2. Falls es eine LID ist, im Key-Store / Signal-Repository nachschlagen
+  if (rawJid.endsWith("@lid")) {
+    try {
+      // Baileys speichert LIDs in keys.get('lid-mapping', ...) oder authState.keys
+      if (keys && typeof keys.get === "function") {
+        const lidMap = await keys.get("lid-mapping", [rawJid.split("@")[0]]);
+        if (lidMap && lidMap[rawJid.split("@")[0]]) {
+          return lidMap[rawJid.split("@")[0]];
+        }
+      }
+    } catch (err) {
+      // Ignorieren falls nicht gefunden
+    }
+  }
+
+  // 3. Fallback: ID unverändert zurückgeben (falls keine Zuordnung existiert)
+  return rawJid.split("@")[0].split(":")[0];
+}
+
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(
     "./auth_info_baileys",
@@ -81,41 +108,30 @@ async function startBot() {
     for (const msg of m.messages) {
       if (msg.key.fromMe) continue;
 
-      // 1. Ursprüngliche JID ermitteln
+      // Mögliche Quellen für die Absender-JID prüfen
       let rawJid =
-        msg.key.participantAlt ||
         msg.key.remoteJidAlt ||
+        msg.key.participantAlt ||
         msg.key.participant ||
         msg.key.remoteJid ||
         "";
 
-      // 2. Falls es eine @lid ist, frag Baileys intern nach der echten @s.whatsapp.net JID
-      if (rawJid.endsWith("@lid")) {
-        try {
-          // Das Gateway von Sebastian nutzt genau diesen Aufruf:
-          const pnJid = await sock.signalRepository?.lidToJid(rawJid);
-          if (pnJid) {
-            rawJid = pnJid; // Bspw: 436505803032@s.whatsapp.net
-          }
-        } catch (err) {
-          console.error("LID-Auflösung fehlgeschlagen:", err);
-        }
+      // Nummer/LID auflösen
+      let senderNumber = await getPhoneNumberFromJid(sock, keys, rawJid);
+
+      // BPS: Falls in msg.key noch immer die LID steht, aber eine Alt-JID irgendwo existiert:
+      const altJid = msg.key.remoteJidAlt || msg.key.participantAlt;
+      if (altJid && altJid.includes("@s.whatsapp.net")) {
+        senderNumber = altJid.split("@")[0].split(":")[0];
       }
 
-      // 3. Normalisieren & Telefonnummer extrahieren
-      const normalizedJid = jidNormalizedUser(rawJid);
-      const phoneNumber = normalizedJid
-        .split("@")[0]
-        .split(":")[0]
-        .replace(/[^0-9]/g, "");
+      // Säubern
+      senderNumber = senderNumber.replace(/[^0-9]/g, "");
 
-      console.log(
-        `Nachricht empfangen von: ${phoneNumber} (Ursprung: ${msg.key.remoteJid})`,
-      );
+      console.log(`Empfangen von Nummer: ${senderNumber}`);
 
-      // Prüfen
-      if (!ALLOWED_USERS.includes(phoneNumber)) {
-        console.log(`Zugriff verweigert für: ${phoneNumber}`);
+      if (!ALLOWED_USERS.includes(senderNumber)) {
+        console.log(`Zugriff verweigert für: ${senderNumber}`);
         continue;
       }
 
