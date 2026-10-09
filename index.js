@@ -3,7 +3,11 @@ const axios = require('axios');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
 const NodeCache = require('node-cache');
-require('dotenv').config();
+try {
+    require('dotenv').config();
+} catch (e) {
+    // In Docker/Portainer ist dotenv nicht nötig, da process.env vom Container kommt
+}
 
 const HA_URL = process.env.HA_URL || 'http://192.168.0.2:8123';
 const HA_TOKEN = process.env.HA_TOKEN;
