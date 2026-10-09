@@ -22,6 +22,7 @@ const HA_URL = process.env.HA_URL || "http://192.168.0.2:8123";
 const HA_TOKEN = process.env.HA_TOKEN;
 const CONVERSATION_AGENT = process.env.CONVERSATION_AGENT || null;
 const STT_ENGINE = process.env.STT_ENGINE || null; // z.B. stt.faster_whisper oder stt.whisper
+const TTS_ENGINE = process.env.TTS_ENGINE || null; // z.B. tts.piper oder tts.google_translate
 const WEBHOOK_PORT = process.env.PORT || 3000;
 
 // -------------------------------------------------------------
@@ -88,8 +89,44 @@ function registerLidMapping(lid, phone) {
   }
 }
 
+// -------------------------------------------------------------
+// Conversation Memory (In-Memory Variable)
+// -------------------------------------------------------------
+const userConversations = {}; // Nummer -> conversation_id
+
 const msgRetryCounterCache = new NodeCache();
 let sock;
+
+/**
+ * Wandelt Text via Home Assistant TTS in eine Sprachnachricht um
+ */
+async function textToSpeech(text) {
+  if (!TTS_ENGINE) return null;
+
+  try {
+    const response = await axios.post(
+      `${HA_URL}/api/tts_get_url`,
+      {
+        engine_id: TTS_ENGINE,
+        message: text,
+        language: "de",
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${HA_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (response.data && response.data.url) {
+      return `${HA_URL}${response.data.url}`;
+    }
+  } catch (error) {
+    console.error("[HA TTS] Fehler bei TTS-Generierung:", error.response?.data || error.message);
+  }
+  return null;
+}
 
 /**
  * Sendet Sprachnachrichten an den Home Assistant STT Endpoint (Whisper)
@@ -257,7 +294,7 @@ async function startBot() {
       const pushName = msg.pushName || NUMBER_TO_NAME[senderNumber] || "Unbekannt";
       const senderJid = msg.key.remoteJid;
 
-      // 1. Textnachrichten extrahieren (alle Typen)
+      // 1. Textnachrichten extrahieren (alle Typen & Interaktive Elemente)
       let text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
@@ -292,9 +329,69 @@ async function startBot() {
         continue;
       }
 
+      const cleanCmd = text.trim().toLowerCase();
+
+      // ---------------------------------------------------------
+      // STEUERBEFEHLE & MENÜS
+      // ---------------------------------------------------------
+      if (cleanCmd === "!reset" || cleanCmd === "/reset" || cleanCmd === "cmd_reset") {
+        delete userConversations[senderNumber];
+        await sock.sendMessage(senderJid, {
+          text: "🔄 Dein Gesprächsverlauf wurde zurückgesetzt.",
+        });
+        continue;
+      }
+
+      if (cleanCmd === "/help" || cleanCmd === "!help" || cleanCmd === "hilfe") {
+        const helpMsg =
+          "🤖 *Home Assistant WhatsApp-Bot*\n\n" +
+          "• *Steuerung:* Schreibe oder sprich einfache Sprachbefehle.\n" +
+          "• `/menu` - Öffnet das interaktive Auswahlmenü.\n" +
+          "• `!reset` - Setzt den aktuellen Gesprächsverlauf zurück.\n" +
+          "• `/status` - Zeigt System-Informationen an.\n" +
+          "• `/help` - Zeigt diese Hilfe an.";
+        await sock.sendMessage(senderJid, { text: helpMsg });
+        continue;
+      }
+
+      if (cleanCmd === "/status") {
+        const statusMsg =
+          "🟢 *System Status*\n\n" +
+          `• Home Assistant: ${HA_URL}\n` +
+          `• STT Engine: ${STT_ENGINE || "Nicht aktiv"}\n` +
+          `• TTS Engine: ${TTS_ENGINE || "Nicht aktiv"}\n` +
+          `• Aktiver Agent: ${CONVERSATION_AGENT || "Default"}\n` +
+          `• Aktive Session: ${userConversations[senderNumber] ? "Ja" : "Nein"}`;
+        await sock.sendMessage(senderJid, { text: statusMsg });
+        continue;
+      }
+
+      if (cleanCmd === "/menu") {
+        const listMessage = {
+          text: "Wähle eine Aktion aus oder starte ein Kommando:",
+          footer: "Home Assistant WhatsApp Bot",
+          title: "🤖 Hauptmenü",
+          buttonText: "Optionen anzeigen",
+          sections: [
+            {
+              title: "Schnellbefehle",
+              rows: [
+                { title: "🔄 Verlauf zurücksetzen", rowId: "cmd_reset", description: "Löscht den Sprach-Kontext" },
+                { title: "ℹ️ System Status", rowId: "/status", description: "Verbindungsdetails anzeigen" },
+                { title: "❓ Hilfe", rowId: "/help", description: "Anleitung und Befehle" },
+              ],
+            },
+          ],
+        };
+        await sock.sendMessage(senderJid, listMessage);
+        continue;
+      }
+
       console.log(`[Nachricht empfangen] Von ${pushName} (${senderNumber}): "${text}"`);
 
-      // An Home Assistant Assist senden
+      // ---------------------------------------------------------
+      // AN HOME ASSISTANT ASSIST SENDEN
+      // ---------------------------------------------------------
       try {
         const payload = {
           text: `[Absender: ${pushName}] ${text}`,
@@ -303,6 +400,10 @@ async function startBot() {
 
         if (CONVERSATION_AGENT) {
           payload.agent_id = CONVERSATION_AGENT;
+        }
+
+        if (userConversations[senderNumber]) {
+          payload.conversation_id = userConversations[senderNumber];
         }
 
         const haResponse = await axios.post(
@@ -316,10 +417,31 @@ async function startBot() {
           }
         );
 
+        if (haResponse.data?.conversation_id) {
+          userConversations[senderNumber] = haResponse.data.conversation_id;
+        }
+
         const responseText =
           haResponse.data?.response?.speech?.plain?.speech || "Befehl ausgeführt.";
 
-        await sock.sendMessage(senderJid, { text: responseText });
+        // Wenn der Absender eine Sprachnachricht geschickt hat UND TTS konfiguriert ist -> Antworte per Sprachnachricht
+        let sentAudio = false;
+        if (isAudio && TTS_ENGINE) {
+          const audioUrl = await textToSpeech(responseText);
+          if (audioUrl) {
+            await sock.sendMessage(senderJid, {
+              audio: { url: audioUrl },
+              mimetype: "audio/ogg; codecs=opus",
+              ptt: true, // ptt: true macht daraus eine echte Sprachnachricht
+            });
+            sentAudio = true;
+          }
+        }
+
+        // Falls keine Sprachnachricht gesendet werden konnte/sollte -> Sende Text
+        if (!sentAudio) {
+          await sock.sendMessage(senderJid, { text: responseText });
+        }
       } catch (error) {
         console.error("Fehler bei Home Assistant:", error.response?.data || error.message);
         await sock.sendMessage(senderJid, {
