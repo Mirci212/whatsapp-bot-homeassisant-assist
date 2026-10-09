@@ -8,6 +8,7 @@ const axios = require("axios");
 const qrcode = require("qrcode-terminal");
 const express = require("express");
 const NodeCache = require("node-cache");
+
 try {
   require("dotenv").config({ override: false });
 } catch (e) {
@@ -30,7 +31,7 @@ const USER_NAMES = (process.env.USER_MAPPING || "")
   .map((name) => name.trim().toLowerCase())
   .filter(Boolean);
 
-// Dynamisches Adressbuch aus Positionen aufbauen (z.B. marco -> 436601234567)
+// Dynamisches Adressbuch aufbauen (z.B. marco -> 436601234567)
 const ADDRESS_BOOK = {};
 USER_NAMES.forEach((name, index) => {
   if (ALLOWED_USERS[index]) {
@@ -38,41 +39,61 @@ USER_NAMES.forEach((name, index) => {
   }
 });
 
+// Optionales LID-Mapping aus ENV (Format: LID1:NUMMER1,LID2:NUMMER2)
+const LID_MAPPING = {};
+if (process.env.LID_MAPPING) {
+  process.env.LID_MAPPING.split(",").forEach((pair) => {
+    const [lid, num] = pair.split(":");
+    if (lid && num) LID_MAPPING[lid.trim()] = num.trim();
+  });
+}
+
 // Cache für Nachricht-Wiederholungen gegen Entschlüsselungsfehler
 const msgRetryCounterCache = new NodeCache();
 
 let sock;
 
-async function getPhoneNumberFromJid(sock, keys, rawJid) {
+/**
+ * Wandelt JIDs und WhatsApp-LIDs zuverlässig in Telefonnummern um
+ */
+async function getPhoneNumberFromJid(keys, rawJid) {
   if (!rawJid) return "";
 
-  // 1. Wenn es bereits eine Phone-Number-JID (@s.whatsapp.net) ist, direkt nutzen
+  // 1. Wenn es bereits eine Phone-Number-JID (@s.whatsapp.net) ist
   if (rawJid.includes("@s.whatsapp.net")) {
     return rawJid.split("@")[0].split(":")[0];
   }
 
-  // 2. Falls es eine LID ist, im Key-Store / Signal-Repository nachschlagen
+  // 2. Falls es eine LID ist (@lid)
   if (rawJid.endsWith("@lid")) {
+    const lidId = rawJid.split("@")[0].split(":")[0];
+
+    // Im optionalen LID-Mapping nachschlagen
+    if (LID_MAPPING[lidId]) {
+      return LID_MAPPING[lidId];
+    }
+
+    // Versuchen, das Mapping aus dem Baileys Session-Store zu lesen
     try {
-      // Baileys speichert LIDs in keys.get('lid-mapping', ...) oder authState.keys
       if (keys && typeof keys.get === "function") {
-        const lidMap = await keys.get("lid-mapping", [rawJid.split("@")[0]]);
-        if (lidMap && lidMap[rawJid.split("@")[0]]) {
-          return lidMap[rawJid.split("@")[0]];
+        const lidMap = await keys.get("lid-mapping", [lidId]);
+        if (lidMap && lidMap[lidId]) {
+          return lidMap[lidId];
         }
       }
     } catch (err) {
-      // Ignorieren falls nicht gefunden
+      // Fallback ignorieren
     }
+
+    return lidId;
   }
 
-  // 3. Fallback: ID unverändert zurückgeben (falls keine Zuordnung existiert)
   return rawJid.split("@")[0].split(":")[0];
 }
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(
-    "./auth_info_baileys",
+    "./auth_info_baileys"
   );
 
   sock = makeWASocket({
@@ -108,7 +129,7 @@ async function startBot() {
     for (const msg of m.messages) {
       if (msg.key.fromMe) continue;
 
-      // Mögliche Quellen für die Absender-JID prüfen
+      // 1. Alt-JIDs bevorzugen (Baileys speichert dort oft die echte Handy-JID)
       let rawJid =
         msg.key.remoteJidAlt ||
         msg.key.participantAlt ||
@@ -116,29 +137,45 @@ async function startBot() {
         msg.key.remoteJid ||
         "";
 
-      // Nummer/LID auflösen
-      let senderNumber = await getPhoneNumberFromJid(sock, keys, rawJid);
+      // 2. Nummer/LID auflösen (state.keys wird korrekt übergeben)
+      let senderNumber = await getPhoneNumberFromJid(state.keys, rawJid);
 
-      // BPS: Falls in msg.key noch immer die LID steht, aber eine Alt-JID irgendwo existiert:
+      // Falls immer noch eine Alt-JID mit Mobilnummer existiert
       const altJid = msg.key.remoteJidAlt || msg.key.participantAlt;
       if (altJid && altJid.includes("@s.whatsapp.net")) {
         senderNumber = altJid.split("@")[0].split(":")[0];
       }
 
-      // Säubern
+      // Suffixe und Sonderzeichen entfernen
       senderNumber = senderNumber.replace(/[^0-9]/g, "");
+
+      // 3. Empfänger-JID für die Antwort bestimmen
+      const senderJid = msg.key.remoteJid;
+
+      // 4. Nachrichtentext extrahieren
+      const text =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.imageMessage?.caption ||
+        "";
+
+      if (!text) continue; // Keine Textnachricht -> überspringen
+
+      const pushName = msg.pushName || "Unbekannt";
 
       console.log(`Empfangen von Nummer: ${senderNumber}`);
 
+      // 5. Zugriffsprüfung
       if (!ALLOWED_USERS.includes(senderNumber)) {
-        console.log(`Zugriff verweigert für: ${senderNumber}`);
+        console.log(`Zugriff verweigert für: ${senderNumber} (Name: ${pushName})`);
         continue;
       }
 
       console.log(
-        `Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`,
+        `Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`
       );
 
+      // 6. An Home Assistant senden
       try {
         const payload = {
           text: `[Absender: ${pushName}] ${text}`,
@@ -157,7 +194,7 @@ async function startBot() {
               Authorization: `Bearer ${HA_TOKEN}`,
               "Content-Type": "application/json",
             },
-          },
+          }
         );
 
         const responseText =
@@ -168,7 +205,7 @@ async function startBot() {
       } catch (error) {
         console.error(
           "Fehler bei Home Assistant:",
-          error.response?.data || error.message,
+          error.response?.data || error.message
         );
         await sock.sendMessage(senderJid, {
           text: "Fehler bei der Verarbeitung in Home Assistant.",
@@ -212,7 +249,7 @@ app.post("/send-message", async (req, res) => {
         targetNumber = cleanRecipient.replace("+", "").trim();
       } else {
         console.error(
-          `Fehler: Name "${recipient}" wurde im USER_MAPPING nicht gefunden.`,
+          `Fehler: Name "${recipient}" wurde im USER_MAPPING nicht gefunden.`
         );
         return res.status(404).json({
           error: `Name "${recipient}" wurde im USER_MAPPING nicht gefunden.`,
@@ -224,7 +261,7 @@ app.post("/send-message", async (req, res) => {
 
     await sock.sendMessage(targetJid, { text: message });
     console.log(
-      `Nachricht gesendet an ${recipient} (${targetNumber}): "${message}"`,
+      `Nachricht gesendet an ${recipient} (${targetNumber}): "${message}"`
     );
     res.json({ success: true });
   } catch (err) {
