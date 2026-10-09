@@ -107,13 +107,13 @@ async function startBot() {
     // Berechtigungsprüfung gegen die extrahierte Nummernliste
     if (ALLOWED_USERS.length > 0 && !ALLOWED_USERS.includes(senderNumber)) {
       console.log(
-        `⛔ Zugriff verweigert für: ${senderNumber} (ID: ${senderJid}, Name: ${pushName})`,
+        `Zugriff verweigert für: ${senderNumber} (ID: ${senderJid}, Name: ${pushName})`,
       );
       return;
     }
 
     console.log(
-      `💬 Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`,
+      `Nachricht von ${pushName} (Tel: ${senderNumber}): "${text}"`,
     );
 
     try {
@@ -148,7 +148,7 @@ async function startBot() {
         error.response?.data || error.message,
       );
       await sock.sendMessage(senderJid, {
-        text: "❌ Fehler bei der Verarbeitung in Home Assistant.",
+        text: "Fehler bei der Verarbeitung in Home Assistant.",
       });
     }
   });
