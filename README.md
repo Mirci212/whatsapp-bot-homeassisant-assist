@@ -1,6 +1,6 @@
 # WhatsApp Home Assistant Integration Bot
 
-[![Open your Home Assistant instance and show the add add-on repository dialog with a specific URL](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FDeinGitHubBenutzer%2Fwhatsapp-bridge-homeassistant)
+[![Open your Home Assistant instance and show the add add-on repository dialog with a specific URL](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/Mirci212/whatsapp-bridge-homeassisant)
 
 Ein robuster und funktionsreicher Node.js-Service zur bidirektionalen Steuerung von Home Assistant über WhatsApp. Der Bot nutzt die Baileys-Library für die WhatsApp-Anbindung und kommuniziert nahtlos mit Home Assistant (Conversation API, STT, TTS und Webhooks).
 
