@@ -3,7 +3,6 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
-  makeInMemoryStore,
 } = require("@whiskeysockets/baileys");
 const axios = require("axios");
 const qrcode = require("qrcode-terminal");
@@ -27,13 +26,9 @@ const TTS_ENGINE = process.env.TTS_ENGINE || null;
 const WEBHOOK_PORT = process.env.PORT || 3000;
 
 // -------------------------------------------------------------
-// Baileys Store für Chat-Verwaltung initialisieren
+// Bekannte Chats für die automatische Reinigung speichern
 // -------------------------------------------------------------
-const store = makeInMemoryStore({});
-store.readFromFile("./auth_info_baileys/baileys_store.json");
-setInterval(() => {
-  store.writeToFile("./auth_info_baileys/baileys_store.json");
-}, 10_000);
+const knownChats = new Set();
 
 // -------------------------------------------------------------
 // Parsing der ALLOWED_USERS (Format: Nummer:Name,Nummer:Name)
@@ -102,31 +97,26 @@ const msgRetryCounterCache = new NodeCache();
 let sock;
 
 /**
- * Automatisches Löschen aller Bot-Chats einmal am Tag
+ * Automatisches Löschen aller bekannten Bot-Chats einmal am Tag
  */
 async function cleanupOldChats() {
   if (!sock) return;
   console.log("[Tägliche Reinigung] Starte das Aufräumen der Bot-Chats...");
-  try {
-    const chats = store.chats.all();
-    for (const chat of chats) {
-      try {
-        await sock.chatModify(
-          {
-            delete: true,
-            lastMessages: [{ key: { remoteJid: chat.id, id: "" } }]
-          },
-          chat.id
-        );
-        console.log(`[Tägliche Reinigung] Chat gelöscht auf Bot-Seite: ${chat.id}`);
-      } catch (err) {
-        // Einzelne Fehler ignorieren (z.B. falls Chat schon leer ist)
-      }
+  for (const jid of knownChats) {
+    try {
+      await sock.chatModify(
+        {
+          delete: true,
+          lastMessages: [{ key: { remoteJid: jid, id: "" } }]
+        },
+        jid
+      );
+      console.log(`[Tägliche Reinigung] Chat gelöscht auf Bot-Seite: ${jid}`);
+    } catch (err) {
+      // Ignorieren falls Chat bereits leer ist
     }
-    console.log("[Tägliche Reinigung] Chat-Bereinigung abgeschlossen!");
-  } catch (error) {
-    console.error("[Tägliche Reinigung] Fehler beim Löschen der Chats:", error.message);
   }
+  console.log("[Tägliche Reinigung] Chat-Bereinigung abgeschlossen!");
 }
 
 function resolveTargetJid(recipient) {
@@ -280,7 +270,6 @@ async function startBot() {
     syncFullHistory: true,
   });
 
-  store.bind(sock.ev);
   sock.ev.on("creds.update", saveCreds);
 
   const handleContacts = (contacts) => {
@@ -314,7 +303,7 @@ async function startBot() {
       // Startet die Reinigung einmal täglich (alle 24 Stunden)
       setInterval(cleanupOldChats, 24 * 60 * 60 * 1000);
       
-      // Führt nach 1 Minute beim Start zusätzlich eine Reinigung durch
+      // Führt nach 1 Minute beim Start einmalig eine Reinigung aus
       setTimeout(cleanupOldChats, 60_000);
     }
   });
@@ -326,6 +315,11 @@ async function startBot() {
       const senderNumber = await resolvePhoneNumber(msg, state.keys);
       const pushName = msg.pushName || NUMBER_TO_NAME[senderNumber] || "Unbekannt";
       const senderJid = msg.key.remoteJid;
+
+      // Chat-JID für die tägliche Reinigung merken
+      if (senderJid && senderJid.endsWith("@s.whatsapp.net")) {
+        knownChats.add(senderJid);
+      }
 
       let text =
         msg.message?.conversation ||
@@ -487,6 +481,7 @@ app.post("/send-message", async (req, res) => {
       return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
     }
 
+    knownChats.add(targetJid);
     await sock.sendMessage(targetJid, { text: message });
     res.json({ success: true });
   } catch (err) {
@@ -510,6 +505,7 @@ app.post("/send-poll", async (req, res) => {
       return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
     }
 
+    knownChats.add(targetJid);
     await sock.sendMessage(targetJid, {
       poll: {
         name: title,
