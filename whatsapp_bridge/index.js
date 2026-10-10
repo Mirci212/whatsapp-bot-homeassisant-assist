@@ -120,14 +120,17 @@ function registerLidMapping(lid, phone) {
 const userConversations = {}; 
 const msgRetryCounterCache = new NodeCache();
 let sock;
+let authState = null;
 
 // Letzte bekannte Nachricht pro Chat (für chatModify delete nötig).
 // Baileys verlangt echte key.id + messageTimestamp, kein ""-Platzhalter.
 const lastMessageCache = new Map();
 
 function trackChatMessage(jid, msg) {
-  if (!jid || !msg?.key?.id || !msg.messageTimestamp) return;
+  if (!jid || !msg?.key?.id) return;
   if (jid === "status@broadcast") return;
+  // messageTimestamp kann bei eigenen gesendeten Nachrichten fehlen -> jetzt setzen
+  const ts = msg.messageTimestamp || Math.floor(Date.now() / 1000);
   lastMessageCache.set(jid, {
     key: {
       remoteJid: msg.key.remoteJid || jid,
@@ -135,12 +138,46 @@ function trackChatMessage(jid, msg) {
       fromMe: Boolean(msg.key.fromMe),
       ...(msg.key.participant ? { participant: msg.key.participant } : {}),
     },
-    messageTimestamp: msg.messageTimestamp,
+    messageTimestamp: ts,
   });
+  // Merke zusätzlich die letzten Keys pro Chat für Fallback-Einzellöschung
+  if (!trackChatMessage.recent) trackChatMessage.recent = new Map();
+  const arr = trackChatMessage.recent.get(jid) || [];
+  arr.push({ key: { remoteJid: msg.key.remoteJid || jid, id: msg.key.id, fromMe: Boolean(msg.key.fromMe) } });
+  if (arr.length > 20) arr.splice(0, arr.length - 20);
+  trackChatMessage.recent.set(jid, arr);
   if (!knownChats.has(jid)) {
     knownChats.add(jid);
     saveChatCache();
   }
+}
+
+// Prüft, ob der App-State-Key für chatModify (clear/delete) vorhanden ist.
+async function getAppStateDiag() {
+  try {
+    const keyId = authState?.creds?.myAppStateKeyId;
+    if (!keyId) return { ok: false, reason: "myAppStateKeyId fehlt (Sync noch nicht fertig oder Session unvollständig)" };
+    let stored = null;
+    try {
+      const res = await authState.keys.get("app-state-sync-key", [keyId]);
+      stored = res?.[keyId];
+    } catch (e) {
+      return { ok: false, reason: `Key-Store Fehler: ${e.message}` };
+    }
+    if (!stored) return { ok: false, reason: `app-state-sync-key "${keyId}" nicht im Store (Volume/Session prüfen)` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
+// PN-Fallback für @lid-Chats: falls Mapping bekannt, zusätzlich PN-JID versuchen
+function getPnFallbackJid(jid) {
+  if (!jid?.endsWith("@lid")) return null;
+  const lid = jid.split("@")[0].split(":")[0];
+  const pn = autoLidMap[lid];
+  if (pn) return `${pn}@s.whatsapp.net`;
+  return null;
 }
 
 function isTrackableChatJid(jid) {
@@ -164,37 +201,107 @@ async function cleanupOldChats() {
   const details = [];
   const done = [];
 
-  for (const jid of [...knownChats]) {
+  const diag = await getAppStateDiag();
+  if (!diag.ok) {
+    console.warn(`[Reinigung] App-State-Key fehlt: ${diag.reason} -> versuche Einzelnachrichten-Fallback.`);
+  }
+
+  // Baileys App-State neu syncen, falls Methode vorhanden (hilft nach Reconnect)
+  if (!diag.ok && typeof sock?.resyncAppState === "function") {
     try {
-      // 1. Verlauf auf Bot-Seite leeren (braucht keine lastMessages in v6.7.x)
+      await sock.resyncAppState(["critical_unblock_low", "regular_high", "regular_low", "critical_block"]);
+      console.log("[Reinigung] App-State Resync angestoßen.");
+    } catch (e) {
+      console.warn("[Reinigung] Resync fehlgeschlagen:", e.message);
+    }
+  }
+
+  for (const jid of [...knownChats]) {
+    // Kandidaten: erst Original-JID, dann PN-Fallback bei @lid
+    const candidates = [jid];
+    const pnFallback = getPnFallbackJid(jid);
+    if (pnFallback && pnFallback !== jid) candidates.push(pnFallback);
+
+    let ok = false;
+    let lastErr = null;
+
+    for (const target of candidates) {
       try {
-        await sock.chatModify({ clear: true }, jid);
-      } catch (clearErr) {
-        console.warn(`[Reinigung] Clear für ${jid} fehlgeschlagen:`, clearErr.message);
-      }
+        // 1. Verlauf auf Bot-Seite leeren
+        try {
+          await sock.chatModify({ clear: true }, target);
+        } catch (clearErr) {
+          console.warn(`[Reinigung] Clear für ${target} fehlgeschlagen:`, clearErr.message);
+          // Clear-Fehler ist fatal für diesen Kandidaten -> nächsten versuchen
+          lastErr = clearErr;
+          continue;
+        }
 
-      // 2. Chat aus der Chatliste entfernen (braucht ECHTE letzte Nachricht)
-      const lastMsg = lastMessageCache.get(jid);
-      if (lastMsg?.key?.id && lastMsg.messageTimestamp) {
-        await sock.chatModify(
-          { delete: true, lastMessages: [lastMsg] },
-          jid
-        );
-      } else {
-        // Ohne bekannte Nachricht kann WhatsApp den Delete nicht abgleichen:
-        // dann bleibt nur Clear übrig, das ist kein Fehler von chatModify.
-        console.warn(`[Reinigung] Keine letzte Nachricht für ${jid} bekannt, nur Verlauf geleert.`);
+        // 2. Chat aus der Chatliste entfernen (braucht ECHTE letzte Nachricht)
+        const lastMsg = lastMessageCache.get(jid) || lastMessageCache.get(target);
+        if (lastMsg?.key?.id && lastMsg.messageTimestamp) {
+          const fixedLast = {
+            key: { ...lastMsg.key, remoteJid: target },
+            messageTimestamp: lastMsg.messageTimestamp,
+          };
+          await sock.chatModify({ delete: true, lastMessages: [fixedLast] }, target);
+        } else {
+          console.warn(`[Reinigung] Keine letzte Nachricht für ${jid} bekannt, nur Verlauf geleert.`);
+        }
+        ok = true;
+        break;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[Reinigung] Kandidat ${target} fehlgeschlagen:`, err.message);
       }
+    }
 
+    // Fallback: einzelne eigene Nachrichten zurückrufen, wenn chatModify am App-State-Key scheitert
+    if (!ok && lastErr?.message?.includes("App state key")) {
+      const recent = trackChatMessage.recent?.get(jid) || [];
+      // Nur eigene Nachrichten können per "delete for everyone" zurückgerufen werden
+      const ownKeys = recent.filter(r => r.key.fromMe).slice(-10);
+      // Falls keine eigenen Keys bekannt: zumindest letzte bekannte eigene Nachricht aus lastMessageCache
+      if (!ownKeys.length) {
+        const lm = lastMessageCache.get(jid);
+        if (lm?.key?.fromMe) ownKeys.push({ key: lm.key });
+      }
+      if (ownKeys.length) {
+        let deleted = 0;
+        for (const r of ownKeys) {
+          try {
+            await sock.sendMessage(jid, { delete: r.key });
+            deleted++;
+          } catch (e) {
+            console.warn(`[Reinigung] Einzellöschung fehlgeschlagen:`, e.message);
+          }
+        }
+        if (deleted > 0) {
+          ok = true;
+          details.push(`⚠️ ${jid}: Chat-Delete ohne App-State-Key nicht möglich, aber ${deleted} eigene Nachrichten zurückgerufen.`);
+          done.push(jid);
+          lastMessageCache.delete(jid);
+          cleared++;
+          continue;
+        }
+      }
+    }
+
+    if (ok) {
       done.push(jid);
       lastMessageCache.delete(jid);
       cleared++;
       console.log(`[Reinigung] Chat bereinigt: ${jid}`);
       details.push(`✅ ${jid}`);
-    } catch (err) {
+    } else {
       failed++;
-      console.error(`[Reinigung] Konnte Chat ${jid} nicht löschen:`, err.message);
-      details.push(`❌ ${jid}: ${err.message}`);
+      const msg = lastErr?.message || "unbekannt";
+      console.error(`[Reinigung] Konnte Chat ${jid} nicht löschen:`, msg);
+      if (msg.includes("App state key")) {
+        details.push(`❌ ${jid}: App-State-Key fehlt (${diag.reason || msg}). Fix: Bot einmal neu koppeln (QR), Volume auth_info_baileys prüfen, nach Connect 1-2 Min Sync abwarten, dann /clean erneut.`);
+      } else {
+        details.push(`❌ ${jid}: ${msg}`);
+      }
     }
   }
 
@@ -203,7 +310,7 @@ async function cleanupOldChats() {
   if (done.length) saveChatCache();
 
   console.log(`[Reinigung] ${cleared} Chats bereinigt, ${failed} Fehler.`);
-  return { cleared, failed, details };
+  return { cleared, failed, details, appState: diag };
 }
 
 /**
@@ -365,6 +472,7 @@ async function resolvePhoneNumber(msg, keys) {
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth_info_baileys");
+  authState = state;
 
   sock = makeWASocket({
     auth: state,
@@ -552,6 +660,10 @@ async function startBot() {
         let reply = `✅ Fertig! ${result.cleared} Chats bereinigt`;
         if (result.failed) reply += `, ${result.failed} Fehler`;
         reply += ".";
+        if (result.appState && !result.appState.ok) {
+          reply += `\n\n⚠️ App-State-Key fehlt: ${result.appState.reason}`;
+          reply += "\nFix: 1) Volume auth_info_baileys prüfen (muss persistent sein), 2) nach Connect 1-2 Min Sync abwarten, 3) sonst Bot einmal neu koppeln (Session löschen + QR scannen).";
+        }
         if (result.details?.length) {
           const short = result.details.slice(0, 20).join("\n");
           reply += `\n\n${short}`;
