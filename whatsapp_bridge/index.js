@@ -35,27 +35,6 @@ let currentTts = process.env.TTS_ENGINE || null;
 // /app wird bei Update/Neustart gewiped -> Session-Key ging verloren.
 // -------------------------------------------------------------
 const AUTH_DIR = fs.existsSync("/data") ? "/data/auth_info_baileys" : path.join(__dirname, "auth_info_baileys");
-const CHAT_CACHE_FILE = path.join(AUTH_DIR, "known_chats.json");
-const knownChats = new Set();
-
-if (fs.existsSync(CHAT_CACHE_FILE)) {
-  try {
-    const savedChats = JSON.parse(fs.readFileSync(CHAT_CACHE_FILE, "utf-8"));
-    savedChats.forEach(jid => knownChats.add(jid));
-  } catch (e) {
-    console.error("[Chat-Cache] Fehler beim Laden:", e.message);
-  }
-}
-
-function saveChatCache() {
-  try {
-    const dir = path.dirname(CHAT_CACHE_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(CHAT_CACHE_FILE, JSON.stringify([...knownChats], null, 2));
-  } catch (e) {
-    console.error("[Chat-Cache] Fehler beim Speichern:", e.message);
-  }
-}
 
 // Parsing der ALLOWED_USERS
 const ALLOWED_USERS = []; 
@@ -122,161 +101,6 @@ function registerLidMapping(lid, phone) {
 const userConversations = {}; 
 const msgRetryCounterCache = new NodeCache();
 let sock;
-let authState = null;
-
-// Letzte bekannte Nachricht pro Chat (für chatModify delete nötig).
-// Baileys verlangt echte key.id + messageTimestamp, kein ""-Platzhalter.
-const lastMessageCache = new Map();
-
-function trackChatMessage(jid, msg) {
-  if (!jid || !msg?.key?.id) return;
-  if (jid === "status@broadcast") return;
-  // messageTimestamp kann bei eigenen gesendeten Nachrichten fehlen -> jetzt setzen
-  const ts = msg.messageTimestamp || Math.floor(Date.now() / 1000);
-  lastMessageCache.set(jid, {
-    key: {
-      remoteJid: msg.key.remoteJid || jid,
-      id: msg.key.id,
-      fromMe: Boolean(msg.key.fromMe),
-      ...(msg.key.participant ? { participant: msg.key.participant } : {}),
-    },
-    messageTimestamp: ts,
-  });
-  if (!knownChats.has(jid)) {
-    knownChats.add(jid);
-    saveChatCache();
-  }
-}
-
-// Prüft, ob der App-State-Key für chatModify (clear/delete) vorhanden ist.
-async function getAppStateDiag() {
-  try {
-    const keyId = authState?.creds?.myAppStateKeyId;
-    if (!keyId) return { ok: false, reason: "myAppStateKeyId fehlt (Sync noch nicht fertig oder Session unvollständig)" };
-    let stored = null;
-    try {
-      const res = await authState.keys.get("app-state-sync-key", [keyId]);
-      stored = res?.[keyId];
-    } catch (e) {
-      return { ok: false, reason: `Key-Store Fehler: ${e.message}` };
-    }
-    if (!stored) return { ok: false, reason: `app-state-sync-key "${keyId}" nicht im Store (Volume/Session prüfen)` };
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, reason: e.message };
-  }
-}
-
-// PN-Fallback für @lid-Chats: falls Mapping bekannt, zusätzlich PN-JID versuchen
-function getPnFallbackJid(jid) {
-  if (!jid?.endsWith("@lid")) return null;
-  const lid = jid.split("@")[0].split(":")[0];
-  const pn = autoLidMap[lid];
-  if (pn) return `${pn}@s.whatsapp.net`;
-  return null;
-}
-
-function isTrackableChatJid(jid) {
-  if (!jid || typeof jid !== "string") return false;
-  return (
-    jid.endsWith("@s.whatsapp.net") ||
-    jid.endsWith("@lid") ||
-    jid.endsWith("@g.us")
-  );
-}
-
-/**
- * Leert Chats nur auf Bot-Seite (clear + delete via chatModify).
- * Beim Kontakt bleibt alles erhalten – das kann WhatsApp nicht remote löschen.
- */
-async function cleanupOldChats() {
-  if (!sock) return { cleared: 0, failed: 0, details: [] };
-  console.log("[Reinigung] Starte das Aufräumen und Löschen aller Chats...");
-  let cleared = 0;
-  let failed = 0;
-  const details = [];
-  const done = [];
-
-  const diag = await getAppStateDiag();
-  if (!diag.ok) {
-    console.warn(`[Reinigung] App-State-Key fehlt: ${diag.reason}.`);
-  }
-
-  // Baileys App-State neu syncen, falls Methode vorhanden (hilft nach Reconnect)
-  if (!diag.ok && typeof sock?.resyncAppState === "function") {
-    try {
-      await sock.resyncAppState(["critical_unblock_low", "regular_high", "regular_low", "critical_block"]);
-      console.log("[Reinigung] App-State Resync angestoßen.");
-    } catch (e) {
-      console.warn("[Reinigung] Resync fehlgeschlagen:", e.message);
-    }
-  }
-
-  for (const jid of [...knownChats]) {
-    // Kandidaten: erst Original-JID, dann PN-Fallback bei @lid
-    const candidates = [jid];
-    const pnFallback = getPnFallbackJid(jid);
-    if (pnFallback && pnFallback !== jid) candidates.push(pnFallback);
-
-    let ok = false;
-    let lastErr = null;
-
-    for (const target of candidates) {
-      try {
-        // 1. Verlauf auf Bot-Seite leeren
-        try {
-          await sock.chatModify({ clear: true }, target);
-        } catch (clearErr) {
-          console.warn(`[Reinigung] Clear für ${target} fehlgeschlagen:`, clearErr.message);
-          // Clear-Fehler ist fatal für diesen Kandidaten -> nächsten versuchen
-          lastErr = clearErr;
-          continue;
-        }
-
-        // 2. Chat aus der Chatliste entfernen (braucht ECHTE letzte Nachricht)
-        const lastMsg = lastMessageCache.get(jid) || lastMessageCache.get(target);
-        if (lastMsg?.key?.id && lastMsg.messageTimestamp) {
-          const fixedLast = {
-            key: { ...lastMsg.key, remoteJid: target },
-            messageTimestamp: lastMsg.messageTimestamp,
-          };
-          await sock.chatModify({ delete: true, lastMessages: [fixedLast] }, target);
-        } else {
-          console.warn(`[Reinigung] Keine letzte Nachricht für ${jid} bekannt, nur Verlauf geleert.`);
-        }
-        ok = true;
-        break;
-      } catch (err) {
-        lastErr = err;
-        console.warn(`[Reinigung] Kandidat ${target} fehlgeschlagen:`, err.message);
-      }
-    }
-
-    if (ok) {
-      done.push(jid);
-      lastMessageCache.delete(jid);
-      cleared++;
-      console.log(`[Reinigung] Chat bereinigt: ${jid}`);
-      details.push(`✅ ${jid} (nur Bot-Seite)`);
-    } else {
-      failed++;
-      const msg = lastErr?.message || "unbekannt";
-      console.error(`[Reinigung] Konnte Chat ${jid} nicht löschen:`, msg);
-      if (msg.includes("App state key")) {
-        details.push(`❌ ${jid}: App-State-Key fehlt (${diag.reason || msg}). Fix: Session in ${AUTH_DIR} löschen + neu koppeln (QR), nach Connect 1-2 Min Sync abwarten, dann /clean erneut.`);
-      } else {
-        details.push(`❌ ${jid}: ${msg}`);
-      }
-    }
-  }
-
-  // Erfolgreich bereinigte Chats aus dem Cache entfernen, damit die Liste nicht ewig wächst
-  for (const jid of done) knownChats.delete(jid);
-  if (done.length) saveChatCache();
-
-  console.log(`[Reinigung] ${cleared} Chats bereinigt, ${failed} Fehler.`);
-  return { cleared, failed, details, appState: diag };
-}
 
 /**
  * Hilfsfunktion zum Abrufen von verfügbaren Conversation Agents aus Home Assistant
@@ -437,7 +261,6 @@ async function resolvePhoneNumber(msg, keys) {
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  authState = state;
 
   sock = makeWASocket({
     auth: state,
@@ -475,45 +298,12 @@ async function startBot() {
         registerLidMapping(sock.user.lid, sock.user.id);
       }
       console.log("WhatsApp Bot ist erfolgreich verbunden!");
-
-      // Timer nur einmal anlegen (sonst bei jedem Reconnect ein weiterer Interval)
-      if (!global.__waCleanupTimer) {
-        global.__waCleanupTimer = setInterval(cleanupOldChats, 24 * 60 * 60 * 1000);
-        setTimeout(cleanupOldChats, 60_000);
-      }
     }
-  });
-
-  // Eigene gesendete Nachrichten mittracken (für späteren Delete nötig)
-  const origSendMessage = sock.sendMessage.bind(sock);
-  sock.sendMessage = async (jid, content, options) => {
-    const sent = await origSendMessage(jid, content, options);
-    if (sent?.key?.id && isTrackableChatJid(jid)) {
-      trackChatMessage(jid, sent);
-    }
-    return sent;
-  };
-
-  // Historie beim Connect mitnehmen, damit /clean auch alte Chats kennt
-  sock.ev.on("messaging-history.set", ({ chats, messages }) => {
-    for (const c of chats || []) {
-      if (isTrackableChatJid(c.id) && !knownChats.has(c.id)) {
-        knownChats.add(c.id);
-      }
-    }
-    for (const m of messages || []) {
-      const jid = m.key?.remoteJid;
-      if (isTrackableChatJid(jid)) trackChatMessage(jid, m);
-    }
-    saveChatCache();
   });
 
   sock.ev.on("messages.upsert", async (m) => {
     for (const msg of m.messages) {
       const senderJid = msg.key.remoteJid;
-      if (isTrackableChatJid(senderJid)) {
-        trackChatMessage(senderJid, msg);
-      }
 
       if (msg.key.fromMe) continue;
 
@@ -582,7 +372,6 @@ async function startBot() {
             "• `/setagent [id]` - Agent setzen oder alle anzeigen\n" +
             "• `/settts [id]` - TTS-Engine setzen oder anzeigen\n" +
             "• `/setstt [id]` - STT-Engine setzen oder anzeigen\n" +
-            "• `/clean` - Löscht alle Chats vollständig\n" +
             "• `/restart` - Startet den Bot neu";
         }
 
@@ -611,31 +400,6 @@ async function startBot() {
 
       if (cleanCmd === "/whoami") {
         await sock.sendMessage(senderJid, { text: `👤 *Dein Profil*\n\n• Name: ${pushName}\n• Nummer: ${senderNumber}\n• Admin: ${isAdmin ? "Ja 👑" : "Nein"}` });
-        continue;
-      }
-
-      // --- ADMIN: CHATS BEREINIGEN ---
-      if (cleanCmd === "/clean" || cleanCmd === "/deletechats") {
-        if (!isAdmin) {
-          await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
-          continue;
-        }
-        await sock.sendMessage(senderJid, { text: "🧹 Lösche alle Chats und Verläufe (nur auf Bot-Seite, nicht bei den Kontakten)..." });
-        const result = await cleanupOldChats();
-        let reply = `✅ Fertig! ${result.cleared} Chats bereinigt`;
-        if (result.failed) reply += `, ${result.failed} Fehler`;
-        reply += ".";
-        if (result.appState && !result.appState.ok) {
-          reply += `\n\n⚠️ App-State-Key fehlt: ${result.appState.reason}`;
-          reply += `\nFix: 1) Session-Ordner ${AUTH_DIR} prüfen (muss persistent sein), 2) nach Connect 1-2 Min Sync abwarten, 3) sonst Session löschen + neu koppeln (QR scannen).`;
-        }
-        if (result.details?.length) {
-          const short = result.details.slice(0, 20).join("\n");
-          reply += `\n\n${short}`;
-          if (result.details.length > 20) reply += `\n… +${result.details.length - 20} weitere`;
-        }
-        reply += "\n\nℹ️ Hinweis: WhatsApp erlaubt kein Löschen beim Kontakt – dort bleibt der Verlauf sichtbar.";
-        await sock.sendMessage(senderJid, { text: reply });
         continue;
       }
 
@@ -794,10 +558,6 @@ app.post("/send-message", async (req, res) => {
       return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
     }
 
-    if (!knownChats.has(targetJid)) {
-      knownChats.add(targetJid);
-      saveChatCache();
-    }
     await sock.sendMessage(targetJid, { text: message });
     res.json({ success: true });
   } catch (err) {
@@ -821,10 +581,6 @@ app.post("/send-poll", async (req, res) => {
       return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
     }
 
-    if (!knownChats.has(targetJid)) {
-      knownChats.add(targetJid);
-      saveChatCache();
-    }
     await sock.sendMessage(targetJid, {
       poll: {
         name: title,

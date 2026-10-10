@@ -11,7 +11,7 @@ Ein robuster und funktionsreicher Node.js-Service zur bidirektionalen Steuerung 
 - **Sprach- & Textsteuerung:** Leitet eingehende Nachrichten (sowie transkribierte Sprachnachrichten via Whisper) direkt an den Home Assistant Conversation Agenten weiter.
 - **Interaktive Umfragen & Nachrichten:** Webhook-APIs zum Senden von Textnachrichten (`/send-message`) und Umfragen/Polls (`/send-poll`) – perfekt für UI-Skripte in Home Assistant.
 - **Admin-Steuerung per Chat:** Der definierte Administrator kann im laufenden Betrieb Agenten, TTS- und STT-Engines wechseln, den Bot neu starten oder Chats bereinigen.
-- **Tägliche Bot-Chat-Bereinigung:** Löscht alte Chats automatisch auf der Bot-Seite, damit der WhatsApp-Speicher nicht überläuft (plus manueller `/clean`-Befehl).
+- **Kein Chat-Verlauf auf der Bridge:** Die Bridge speichert keine Chat-Verläufe – jede Nachricht wird direkt an Home Assistant weitergereicht.
 - **Zahlen-Fallback-Menü:** Einfache Zifferneingaben (`1`, `2`, `3`) als stabile Alternative zu interaktiven Buttons.
 - **Dual-Deployment:** Kann sowohl als offizielles **Home Assistant Add-on** (aus dem Repository im Unterordner `whatsapp_bridge`)[cite: 3, 4] als auch als **Standalone Docker Container** (über GHCR) betrieben werden.
 
@@ -77,7 +77,6 @@ Eingehende Nachrichten von erlaubten Nummern werden verarbeitet. Zusätzlich ste
 * `/setagent [id]` — Setzt den Agenten oder listet alle verfügbaren HA-Agenten auf.
 * `/settts [id]` — Setzt die TTS-Engine oder zeigt Optionen.
 * `/setstt [id]` — Setzt die STT-Engine oder zeigt Optionen.
-* `/clean` — Räumt sofort alle Chats auf der Bot-Seite auf.
 * `/restart` — Startet den Bot-Dienst neu.
 
 ---
