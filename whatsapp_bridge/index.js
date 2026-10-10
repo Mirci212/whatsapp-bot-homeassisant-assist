@@ -140,12 +140,6 @@ function trackChatMessage(jid, msg) {
     },
     messageTimestamp: ts,
   });
-  // Merke zusätzlich die letzten Keys pro Chat für Fallback-Einzellöschung
-  if (!trackChatMessage.recent) trackChatMessage.recent = new Map();
-  const arr = trackChatMessage.recent.get(jid) || [];
-  arr.push({ key: { remoteJid: msg.key.remoteJid || jid, id: msg.key.id, fromMe: Boolean(msg.key.fromMe) } });
-  if (arr.length > 20) arr.splice(0, arr.length - 20);
-  trackChatMessage.recent.set(jid, arr);
   if (!knownChats.has(jid)) {
     knownChats.add(jid);
     saveChatCache();
@@ -190,8 +184,8 @@ function isTrackableChatJid(jid) {
 }
 
 /**
- * Löscht alle bekannten Bot-Chats vollständig (nur auf Bot-Seite!
- * "Für alle löschen" geht via Baileys nicht für ganze Chats).
+ * Leert Chats nur auf Bot-Seite (clear + delete via chatModify).
+ * Beim Kontakt bleibt alles erhalten – das kann WhatsApp nicht remote löschen.
  */
 async function cleanupOldChats() {
   if (!sock) return { cleared: 0, failed: 0, details: [] };
@@ -203,7 +197,7 @@ async function cleanupOldChats() {
 
   const diag = await getAppStateDiag();
   if (!diag.ok) {
-    console.warn(`[Reinigung] App-State-Key fehlt: ${diag.reason} -> versuche Einzelnachrichten-Fallback.`);
+    console.warn(`[Reinigung] App-State-Key fehlt: ${diag.reason}.`);
   }
 
   // Baileys App-State neu syncen, falls Methode vorhanden (hilft nach Reconnect)
@@ -256,43 +250,12 @@ async function cleanupOldChats() {
       }
     }
 
-    // Fallback: einzelne eigene Nachrichten zurückrufen, wenn chatModify am App-State-Key scheitert
-    if (!ok && lastErr?.message?.includes("App state key")) {
-      const recent = trackChatMessage.recent?.get(jid) || [];
-      // Nur eigene Nachrichten können per "delete for everyone" zurückgerufen werden
-      const ownKeys = recent.filter(r => r.key.fromMe).slice(-10);
-      // Falls keine eigenen Keys bekannt: zumindest letzte bekannte eigene Nachricht aus lastMessageCache
-      if (!ownKeys.length) {
-        const lm = lastMessageCache.get(jid);
-        if (lm?.key?.fromMe) ownKeys.push({ key: lm.key });
-      }
-      if (ownKeys.length) {
-        let deleted = 0;
-        for (const r of ownKeys) {
-          try {
-            await sock.sendMessage(jid, { delete: r.key });
-            deleted++;
-          } catch (e) {
-            console.warn(`[Reinigung] Einzellöschung fehlgeschlagen:`, e.message);
-          }
-        }
-        if (deleted > 0) {
-          ok = true;
-          details.push(`⚠️ ${jid}: Chat-Delete ohne App-State-Key nicht möglich, aber ${deleted} eigene Nachrichten zurückgerufen.`);
-          done.push(jid);
-          lastMessageCache.delete(jid);
-          cleared++;
-          continue;
-        }
-      }
-    }
-
     if (ok) {
       done.push(jid);
       lastMessageCache.delete(jid);
       cleared++;
       console.log(`[Reinigung] Chat bereinigt: ${jid}`);
-      details.push(`✅ ${jid}`);
+      details.push(`✅ ${jid} (nur Bot-Seite)`);
     } else {
       failed++;
       const msg = lastErr?.message || "unbekannt";
