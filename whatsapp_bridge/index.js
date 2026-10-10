@@ -3,6 +3,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
+  makeInMemoryStore,
 } = require("@whiskeysockets/baileys");
 const axios = require("axios");
 const qrcode = require("qrcode-terminal");
@@ -37,6 +38,8 @@ const knownChats = new Set();
 const ALLOWED_USERS = []; 
 const ADDRESS_BOOK = {};  
 const NUMBER_TO_NAME = {};
+// Store für die Chat-Verwaltung initialisieren
+const store = makeInMemoryStore({});
 
 if (process.env.ALLOWED_USERS) {
   const entries = process.env.ALLOWED_USERS.split(",");
@@ -108,15 +111,13 @@ async function cleanupOldChats() {
   let count = 0;
 
   try {
-    // Holt alle aktiven Chats direkt aus der Socket-Verbindung
-    const chats = sock.chats ? sock.chats.all() : [];
-    
+    const chats = store.chats.all();
     for (const chat of chats) {
       if (chat.id && chat.id.endsWith("@s.whatsapp.net")) {
         try {
           await sock.chatModify(
             {
-              delete: true,
+              delete: starteDelete => true,
               lastMessages: [{ key: { remoteJid: chat.id, id: "" } }]
             },
             chat.id
@@ -126,7 +127,7 @@ async function cleanupOldChats() {
       }
     }
   } catch (e) {
-    console.error("[Reinigung] Fehler beim Durchlaufen der Chats:", e.message);
+    console.error("[Reinigung] Fehler:", e.message);
   }
 
   console.log(`[Reinigung] ${count} Chats auf Bot-Seite bereinigt.`);
