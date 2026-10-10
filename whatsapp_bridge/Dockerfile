@@ -1,13 +1,14 @@
 FROM node:20-alpine
 
-# FFmpeg für Audio-Konvertierung (Whisper STT) installieren
 RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 
-COPY package*.json ./
+# Hier nur gezielt die package.json kopieren
+COPY package.json ./
 RUN npm install
 
+# Rest des Codes kopieren
 COPY . .
 
 RUN chmod +x /app/run.sh

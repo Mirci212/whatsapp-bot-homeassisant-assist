@@ -126,7 +126,7 @@ Füge dies in deine `configuration.yaml` ein, um die Endpunkte anzusprechen:
 ```yaml
 rest_command:
   whatsapp_send_message:
-    url: "[http://192.168.0.2:3000/send-message](http://192.168.0.2:3000/send-message)"
+    url: "http://192.168.0.2:3000/send-message"
     method: POST
     headers:
       Content-Type: "application/json"
@@ -137,7 +137,7 @@ rest_command:
       }
 
   whatsapp_send_poll:
-    url: "[http://192.168.0.2:3000/send-poll](http://192.168.0.2:3000/send-poll)"
+    url: "http://192.168.0.2:3000/send-poll"
     method: POST
     headers:
       Content-Type: "application/json"
