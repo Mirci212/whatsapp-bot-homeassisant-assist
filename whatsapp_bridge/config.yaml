@@ -1,0 +1,31 @@
+name: "WhatsApp Home Assistant Bridge"
+version: "1.0.0"
+slug: "whatsapp_ha_bridge"
+description: "WhatsApp Bot Bridge für Home Assistant mit Baileys und KI-Integration"
+url: "https://github.com/DeinGitHubBenutzer/DeinRepoName"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: application
+boot: auto
+ports:
+  3000/tcp: 3000
+ports_description:
+  3000/tcp: Webhook und API Port
+schema:
+  ADMIN_NUMBER: string
+  ALLOWED_USERS: string
+  CONVERSATION_AGENT: string
+  STT_ENGINE: string
+  TTS_ENGINE: string
+options:
+  ADMIN_NUMBER: ""
+  ALLOWED_USERS: ""
+  CONVERSATION_AGENT: ""
+  STT_ENGINE: ""
+  TTS_ENGINE: ""
+environment:
+  PORT: "3000"

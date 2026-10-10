@@ -40,9 +40,9 @@ jobs:
       - name: Docker Image bauen und nach GHCR pushen
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }} # Pusht bei Push, Main-Branch & manuell (aber nicht bei PRs)
+          context: ./whatsapp_bridge          # <-- Hier auf den Ordner zeigen
+          file: ./whatsapp_bridge/Dockerfile   # <-- Pfad zum Dockerfile anpassen
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
