@@ -31,9 +31,11 @@ let currentStt = process.env.STT_ENGINE || null;
 let currentTts = process.env.TTS_ENGINE || null;
 
 // -------------------------------------------------------------
-// Persistenter Chat-Cache (überlebt Container-Neustarts)
+// Persistenter Speicher: im HA Add-on ist nur /data persistent,
+// /app wird bei Update/Neustart gewiped -> Session-Key ging verloren.
 // -------------------------------------------------------------
-const CHAT_CACHE_FILE = path.join(__dirname, "auth_info_baileys", "known_chats.json");
+const AUTH_DIR = fs.existsSync("/data") ? "/data/auth_info_baileys" : path.join(__dirname, "auth_info_baileys");
+const CHAT_CACHE_FILE = path.join(AUTH_DIR, "known_chats.json");
 const knownChats = new Set();
 
 if (fs.existsSync(CHAT_CACHE_FILE)) {
@@ -82,7 +84,7 @@ if (ADMIN_NUMBER && !ALLOWED_USERS.includes(ADMIN_NUMBER)) {
 }
 
 // Persistent LID-Cache System
-const LID_CACHE_FILE = path.join(__dirname, "auth_info_baileys", "lid_cache.json");
+const LID_CACHE_FILE = path.join(AUTH_DIR, "lid_cache.json");
 const autoLidMap = {};
 
 if (fs.existsSync(LID_CACHE_FILE)) {
@@ -261,7 +263,7 @@ async function cleanupOldChats() {
       const msg = lastErr?.message || "unbekannt";
       console.error(`[Reinigung] Konnte Chat ${jid} nicht löschen:`, msg);
       if (msg.includes("App state key")) {
-        details.push(`❌ ${jid}: App-State-Key fehlt (${diag.reason || msg}). Fix: Bot einmal neu koppeln (QR), Volume auth_info_baileys prüfen, nach Connect 1-2 Min Sync abwarten, dann /clean erneut.`);
+        details.push(`❌ ${jid}: App-State-Key fehlt (${diag.reason || msg}). Fix: Session in ${AUTH_DIR} löschen + neu koppeln (QR), nach Connect 1-2 Min Sync abwarten, dann /clean erneut.`);
       } else {
         details.push(`❌ ${jid}: ${msg}`);
       }
@@ -434,7 +436,7 @@ async function resolvePhoneNumber(msg, keys) {
 }
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("./auth_info_baileys");
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   authState = state;
 
   sock = makeWASocket({
@@ -625,7 +627,7 @@ async function startBot() {
         reply += ".";
         if (result.appState && !result.appState.ok) {
           reply += `\n\n⚠️ App-State-Key fehlt: ${result.appState.reason}`;
-          reply += "\nFix: 1) Volume auth_info_baileys prüfen (muss persistent sein), 2) nach Connect 1-2 Min Sync abwarten, 3) sonst Bot einmal neu koppeln (Session löschen + QR scannen).";
+          reply += `\nFix: 1) Session-Ordner ${AUTH_DIR} prüfen (muss persistent sein), 2) nach Connect 1-2 Min Sync abwarten, 3) sonst Session löschen + neu koppeln (QR scannen).`;
         }
         if (result.details?.length) {
           const short = result.details.slice(0, 20).join("\n");
