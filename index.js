@@ -20,10 +20,15 @@ try {
 
 const HA_URL = process.env.HA_URL || "http://192.168.0.2:8123";
 const HA_TOKEN = process.env.HA_TOKEN;
-const CONVERSATION_AGENT = process.env.CONVERSATION_AGENT || null;
-const STT_ENGINE = process.env.STT_ENGINE || null; 
-const TTS_ENGINE = process.env.TTS_ENGINE || null; 
 const WEBHOOK_PORT = process.env.PORT || 3000;
+
+// Admin-Nummer bereinigen (nur Ziffern)
+const ADMIN_NUMBER = process.env.ADMIN_NUMBER ? process.env.ADMIN_NUMBER.replace(/[^0-9]/g, "") : "";
+
+// Dynamische Laufzeit-Variablen (können vom Admin per Chat geändert werden)
+let currentAgent = process.env.CONVERSATION_AGENT || null;
+let currentStt = process.env.STT_ENGINE || null;
+let currentTts = process.env.TTS_ENGINE || null;
 
 // -------------------------------------------------------------
 // Bekannte Chats für die automatische Reinigung speichern
@@ -52,6 +57,11 @@ if (process.env.ALLOWED_USERS) {
       }
     }
   });
+}
+
+// Falls Admin-Nummer definiert ist, sicherstellen dass sie erlaubt ist
+if (ADMIN_NUMBER && !ALLOWED_USERS.includes(ADMIN_NUMBER)) {
+  ALLOWED_USERS.push(ADMIN_NUMBER);
 }
 
 // -------------------------------------------------------------
@@ -112,9 +122,7 @@ async function cleanupOldChats() {
         jid
       );
       console.log(`[Tägliche Reinigung] Chat gelöscht auf Bot-Seite: ${jid}`);
-    } catch (err) {
-      // Ignorieren falls Chat bereits leer ist
-    }
+    } catch (err) {}
   }
   console.log("[Tägliche Reinigung] Chat-Bereinigung abgeschlossen!");
 }
@@ -135,13 +143,13 @@ function resolveTargetJid(recipient) {
 }
 
 async function textToSpeech(text) {
-  if (!TTS_ENGINE) return null;
+  if (!currentTts) return null;
 
   try {
     const urlResponse = await axios.post(
       `${HA_URL}/api/tts_get_url`,
       {
-        engine_id: TTS_ENGINE,
+        engine_id: currentTts,
         message: text,
         language: "de",
       },
@@ -163,8 +171,8 @@ async function textToSpeech(text) {
 }
 
 async function transcribeAudio(msg) {
-  if (!STT_ENGINE) {
-    console.error("[HA STT] Keine STT_ENGINE in .env konfiguriert.");
+  if (!currentStt) {
+    console.error("[HA STT] Keine STT_ENGINE aktiv.");
     return null;
   }
 
@@ -188,7 +196,7 @@ async function transcribeAudio(msg) {
     const wavBuffer = fs.readFileSync(tmpWavPath);
 
     const response = await axios.post(
-      `${HA_URL}/api/stt/${STT_ENGINE}`,
+      `${HA_URL}/api/stt/${currentStt}`,
       wavBuffer,
       {
         headers: {
@@ -300,10 +308,7 @@ async function startBot() {
       }
       console.log("WhatsApp Bot ist erfolgreich verbunden!");
 
-      // Startet die Reinigung einmal täglich (alle 24 Stunden)
       setInterval(cleanupOldChats, 24 * 60 * 60 * 1000);
-      
-      // Führt nach 1 Minute beim Start einmalig eine Reinigung aus
       setTimeout(cleanupOldChats, 60_000);
     }
   });
@@ -315,8 +320,8 @@ async function startBot() {
       const senderNumber = await resolvePhoneNumber(msg, state.keys);
       const pushName = msg.pushName || NUMBER_TO_NAME[senderNumber] || "Unbekannt";
       const senderJid = msg.key.remoteJid;
+      const isAdmin = ADMIN_NUMBER && senderNumber === ADMIN_NUMBER;
 
-      // Chat-JID für die tägliche Reinigung merken
       if (senderJid && senderJid.endsWith("@s.whatsapp.net")) {
         knownChats.add(senderJid);
       }
@@ -345,7 +350,7 @@ async function startBot() {
       if (!text) continue;
 
       if (!ALLOWED_USERS.includes(senderNumber)) {
-        console.log(`[Zugriff verweigert] Nummer: ${senderNumber} (Name: ${pushName})`);
+        console.log(`[Zugriff verweigert] Nummer: ${senderNumber} (Name:${pushName})`);
         continue;
       }
 
@@ -357,7 +362,7 @@ async function startBot() {
       if (cleanCmd === "3") cleanCmd = "/help";
 
       // ---------------------------------------------------------
-      // STEUERBEFEHLE & MENÜS
+      // STEUERBEFEHLE & ADMIN-BEFEHLE
       // ---------------------------------------------------------
       if (cleanCmd === "!reset" || cleanCmd === "/reset" || cleanCmd === "cmd_reset" || cleanCmd.includes("verlauf zurücksetzen")) {
         delete userConversations[senderNumber];
@@ -368,26 +373,89 @@ async function startBot() {
       }
 
       if (cleanCmd === "/help" || cleanCmd === "!help" || cleanCmd === "hilfe" || cleanCmd.includes("hilfe")) {
-        const helpMsg =
+        let helpMsg =
           "🤖 *Home Assistant WhatsApp-Bot*\n\n" +
           "• *Steuerung:* Schreibe oder sprich einfache Sprachbefehle.\n" +
-          "• `/menu` - Öffnet das interaktive Auswahlmenü.\n" +
           "• `1` oder `!reset` - Setzt den Gesprächsverlauf zurück.\n" +
           "• `2` oder `/status` - Zeigt System-Informationen an.\n" +
-          "• `3` oder `/help` - Zeigt diese Hilfe an.";
+          "• `/ping` - Bot-Erreichbarkeit & Laufzeit.\n" +
+          "• `/whoami` - Zeigt deine Benutzerinfo.";
+
+        if (isAdmin) {
+          helpMsg += 
+            "\n\n👑 *Admin-Befehle:*\n" +
+            "• `/setagent <id>` - Ändert den HA Agent\n" +
+            "• `/settts <id>` - Ändert die TTS Engine\n" +
+            "• `/setstt <id>` - Ändert die STT Engine\n" +
+            "• `/restart` - Startet den Bot neu";
+        }
+
         await sock.sendMessage(senderJid, { text: helpMsg });
         continue;
       }
 
-      if (cleanCmd === "/status" || cleanCmd.includes("system status")) {
+      if (cleanCmd === "/status") {
         const statusMsg =
           "🟢 *System Status*\n\n" +
           `• Home Assistant: ${HA_URL}\n` +
-          `• STT Engine: ${STT_ENGINE || "Nicht aktiv"}\n` +
-          `• TTS Engine: ${TTS_ENGINE || "Nicht aktiv"}\n` +
-          `• Aktiver Agent: ${CONVERSATION_AGENT || "Default"}\n` +
+          `• STT Engine: ${currentStt || "Nicht aktiv"}\n` +
+          `• TTS Engine: ${currentTts || "Nicht aktiv"}\n` +
+          `• Aktiver Agent: ${currentAgent || "Default"}\n` +
+          `• Admin-Modus: ${isAdmin ? "Aktiv (" + senderNumber + ")" : "Nein"}\n` +
           `• Aktive Session: ${userConversations[senderNumber] ? "Ja" : "Nein"}`;
         await sock.sendMessage(senderJid, { text: statusMsg });
+        continue;
+      }
+
+      if (cleanCmd === "/ping") {
+        const uptimeSeconds = Math.floor(process.uptime());
+        await sock.sendMessage(senderJid, { text: `🏓 Pong! Bot läuft stabil.\n⏱️ Laufzeit: ${uptimeSeconds} Sekunden` });
+        continue;
+      }
+
+      if (cleanCmd === "/whoami") {
+        await sock.sendMessage(senderJid, { text: `👤 *Dein Profil*\n\n• Name: ${pushName}\n• Nummer: ${senderNumber}\n• Admin: ${isAdmin ? "Ja 👑" : "Nein"}` });
+        continue;
+      }
+
+      // --- NUR ADMIN BEFEHLE ---
+      if (cleanCmd.startsWith("/setagent ")) {
+        if (!isAdmin) {
+          await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
+          continue;
+        }
+        currentAgent = text.replace("/setagent", "").trim();
+        await sock.sendMessage(senderJid, { text: `✅ Konversations-Agent geändert zu:\n\`${currentAgent}\`` });
+        continue;
+      }
+
+      if (cleanCmd.startsWith("/settts ")) {
+        if (!isAdmin) {
+          await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
+          continue;
+        }
+        currentTts = text.replace("/settts", "").trim();
+        await sock.sendMessage(senderJid, { text: `✅ TTS-Engine geändert zu:\n\`${currentTts}\`` });
+        continue;
+      }
+
+      if (cleanCmd.startsWith("/setstt ")) {
+        if (!isAdmin) {
+          await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
+          continue;
+        }
+        currentStt = text.replace("/setstt", "").trim();
+        await sock.sendMessage(senderJid, { text: `✅ STT-Engine geändert zu:\n\`${currentStt}\`` });
+        continue;
+      }
+
+      if (cleanCmd === "/restart") {
+        if (!isAdmin) {
+          await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
+          continue;
+        }
+        await sock.sendMessage(senderJid, { text: "🔄 Bot wird im Admin-Auftrag neu gestartet..." });
+        setTimeout(() => process.exit(0), 1000);
         continue;
       }
 
@@ -410,8 +478,8 @@ async function startBot() {
           language: "de",
         };
 
-        if (CONVERSATION_AGENT) {
-          payload.agent_id = CONVERSATION_AGENT;
+        if (currentAgent) {
+          payload.agent_id = currentAgent;
         }
 
         if (userConversations[senderNumber]) {
@@ -437,7 +505,7 @@ async function startBot() {
           haResponse.data?.response?.speech?.plain?.speech || "Befehl ausgeführt.";
 
         let sentAudio = false;
-        if (isAudio && TTS_ENGINE) {
+        if (isAudio && currentTts) {
           const audioUrl = await textToSpeech(responseText);
           if (audioUrl) {
             await sock.sendMessage(senderJid, {
