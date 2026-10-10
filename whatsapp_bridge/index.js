@@ -129,17 +129,36 @@ async function cleanupOldChats() {
   console.log("[Reinigung] Starte das Aufräumen der Bot-Chats...");
   let count = 0;
 
-  for (const jid of knownChats) {
-    try {
-      await sock.chatModify(
-        {
-          delete: true,
-          lastMessages: [{ key: { remoteJid: jid, id: "" } }]
-        },
-        jid
-      );
-      count++;
-    } catch (err) {}
+  try {
+    // 1. Alle bekannten Chats aus unserem Set hinzufügen
+    const chatsToClean = new Set([...knownChats]);
+
+    // 2. Versuchen, zusätzlich alle aktiven Chats aus dem Baileys-Store/Kontakten zu fischen
+    if (sock.store && sock.store.chats) {
+      for (const jid of sock.store.chats.keys()) {
+        chatsToClean.add(jid);
+      }
+    }
+
+    // 3. Führe die Löschung für jeden gefundenen Chat durch (außer man selbst)
+    for (const jid of chatsToClean) {
+      if (!jid || jid.endsWith("@g.us")) continue; // Optional: Gruppen ausschließen falls gewünscht
+      try {
+        await sock.chatModify(
+          {
+            delete: true,
+            lastMessages: [{ key: { remoteJid: jid, id: "" } }]
+          },
+          jid
+        );
+        count++;
+        console.log(`[Reinigung] Chat gelöscht: ${jid}`);
+      } catch (err) {
+        // Ignorieren, falls der Chat bereits leer ist oder nicht existiert
+      }
+    }
+  } catch (e) {
+    console.error("[Reinigung] Fehler:", e.message);
   }
 
   console.log(`[Reinigung] ${count} Chats auf Bot-Seite bereinigt.`);
