@@ -18,8 +18,35 @@ try {
   // In Docker / Portainer werden ENV-Variablen direkt geladen
 }
 
-const HA_URL = process.env.HA_URL || "http://192.168.0.2:8123";
-const HA_TOKEN = process.env.HA_TOKEN;
+// HA_URL normalisieren: \r/Whitespace (CRLF-.env!) und trailing Slashes killen,
+// sonst baut axios "Invalid URL" (z.B. "http://host:8123\r/api/...").
+const HA_URL = (process.env.HA_URL || "http://192.168.0.2:8123").replace(/[\r\n]+/g, "").trim().replace(/\/+$/, "");
+const HA_TOKEN = process.env.HA_TOKEN?.replace(/[\r\n]+/g, "").trim();
+
+function haUrl(p) {
+  return `${HA_URL}${p.startsWith("/") ? p : "/" + p}`;
+}
+
+function logHaError(tag, error) {
+  const url = error.config?.url || error.request?.path || "(keine URL)";
+  const status = error.response?.status;
+  const data = error.response?.data;
+  console.error(`[${tag}] ${error.code || ""} ${error.message} | URL: ${url}${status ? ` | HTTP ${status}` : ""}${data ? ` | Antwort: ${typeof data === "string" ? data.slice(0, 300) : JSON.stringify(data).slice(0, 300)}` : ""}`);
+}
+
+// Beim Start einmal HA-Erreichbarkeit prüfen (fail fast mit Klartext statt später "Invalid URL")
+(async () => {
+  console.log(`[HA] URL: ${HA_URL} | Token: ${HA_TOKEN ? "gesetzt" : "FEHLT!"}`);
+  try {
+    const res = await axios.get(haUrl("/api/"), {
+      headers: HA_TOKEN ? { Authorization: `Bearer ${HA_TOKEN}` } : {},
+      timeout: 10000,
+    });
+    console.log(`[HA] Erreichbar: ${res.data?.message || "OK"}`);
+  } catch (error) {
+    logHaError("HA Check", error);
+  }
+})();
 const WEBHOOK_PORT = process.env.PORT || 3000;
 
 // Admin-Nummer bereinigen (nur Ziffern)
@@ -107,7 +134,7 @@ let sock;
  */
 async function fetchAvailableAgents() {
   try {
-    const res = await axios.get(`${HA_URL}/api/states`, {
+    const res = await axios.get(haUrl("/api/states"), {
       headers: { Authorization: `Bearer ${HA_TOKEN}` }
     });
     return res.data
@@ -138,7 +165,7 @@ async function textToSpeech(text) {
 
   try {
     const urlResponse = await axios.post(
-      `${HA_URL}/api/tts_get_url`,
+      haUrl("/api/tts_get_url"),
       {
         engine_id: currentTts,
         message: text,
@@ -152,9 +179,32 @@ async function textToSpeech(text) {
       }
     );
 
-    if (urlResponse.data?.url) {
-      return `${HA_URL}${urlResponse.data.url}`;
+    const returnedUrl = urlResponse.data?.url;
+    if (!returnedUrl || typeof returnedUrl !== "string") {
+      console.error("[HA TTS] Home Assistant hat keine Audio-URL zurückgegeben.");
+      return null;
     }
+
+    let audioUrl;
+    try {
+      audioUrl = new URL(returnedUrl, `${HA_URL}/`).toString();
+    } catch (error) {
+      console.error("[HA TTS] Ungültige Audio-URL von Home Assistant:", returnedUrl);
+      return null;
+    }
+
+    const audioResponse = await axios.get(audioUrl, {
+      responseType: "arraybuffer",
+      headers: {
+        Authorization: `Bearer ${HA_TOKEN}`,
+      },
+    });
+
+    const contentType = audioResponse.headers["content-type"]?.split(";")[0];
+    return {
+      buffer: Buffer.from(audioResponse.data),
+      mimetype: contentType?.startsWith("audio/") ? contentType : "audio/ogg",
+    };
   } catch (error) {
     console.error("[HA TTS] Fehler bei TTS-Generierung:", error.response?.data || error.message);
   }
@@ -187,7 +237,7 @@ async function transcribeAudio(msg) {
     const wavBuffer = fs.readFileSync(tmpWavPath);
 
     const response = await axios.post(
-      `${HA_URL}/api/stt/${currentStt}`,
+      haUrl(`/api/stt/${currentStt}`),
       wavBuffer,
       {
         headers: {
@@ -496,7 +546,7 @@ async function startBot() {
         }
 
         const haResponse = await axios.post(
-          `${HA_URL}/api/conversation/process`,
+          haUrl("/api/conversation/process"),
           payload,
           {
             headers: {
@@ -515,11 +565,11 @@ async function startBot() {
 
         let sentAudio = false;
         if (isAudio && currentTts) {
-          const audioUrl = await textToSpeech(responseText);
-          if (audioUrl) {
+          const audio = await textToSpeech(responseText);
+          if (audio) {
             await sock.sendMessage(senderJid, {
-              audio: { url: audioUrl },
-              mimetype: "audio/ogg; codecs=opus",
+              audio: audio.buffer,
+              mimetype: audio.mimetype,
               ptt: true,
             });
             sentAudio = true;
@@ -530,7 +580,7 @@ async function startBot() {
           await sock.sendMessage(senderJid, { text: responseText });
         }
       } catch (error) {
-        console.error("Fehler bei Home Assistant:", error.response?.data || error.message);
+        logHaError("HA Conversation", error);
         await sock.sendMessage(senderJid, {
           text: "Fehler bei der Verarbeitung in Home Assistant.",
         });
