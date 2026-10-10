@@ -3,7 +3,6 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
-  makeInMemoryStore,
 } = require("@whiskeysockets/baileys");
 const axios = require("axios");
 const qrcode = require("qrcode-terminal");
@@ -31,15 +30,35 @@ let currentAgent = process.env.CONVERSATION_AGENT || null;
 let currentStt = process.env.STT_ENGINE || null;
 let currentTts = process.env.TTS_ENGINE || null;
 
-// Bekannte Chats für die automatische Reinigung
+// -------------------------------------------------------------
+// Persistenter Chat-Cache (überlebt Container-Neustarts)
+// -------------------------------------------------------------
+const CHAT_CACHE_FILE = path.join(__dirname, "auth_info_baileys", "known_chats.json");
 const knownChats = new Set();
+
+if (fs.existsSync(CHAT_CACHE_FILE)) {
+  try {
+    const savedChats = JSON.parse(fs.readFileSync(CHAT_CACHE_FILE, "utf-8"));
+    savedChats.forEach(jid => knownChats.add(jid));
+  } catch (e) {
+    console.error("[Chat-Cache] Fehler beim Laden:", e.message);
+  }
+}
+
+function saveChatCache() {
+  try {
+    const dir = path.dirname(CHAT_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(CHAT_CACHE_FILE, JSON.stringify([...knownChats], null, 2));
+  } catch (e) {
+    console.error("[Chat-Cache] Fehler beim Speichern:", e.message);
+  }
+}
 
 // Parsing der ALLOWED_USERS
 const ALLOWED_USERS = []; 
 const ADDRESS_BOOK = {};  
 const NUMBER_TO_NAME = {};
-// Store für die Chat-Verwaltung initialisieren
-const store = makeInMemoryStore({});
 
 if (process.env.ALLOWED_USERS) {
   const entries = process.env.ALLOWED_USERS.split(",");
@@ -110,24 +129,17 @@ async function cleanupOldChats() {
   console.log("[Reinigung] Starte das Aufräumen der Bot-Chats...");
   let count = 0;
 
-  try {
-    const chats = store.chats.all();
-    for (const chat of chats) {
-      if (chat.id && chat.id.endsWith("@s.whatsapp.net")) {
-        try {
-          await sock.chatModify(
-            {
-              delete: starteDelete => true,
-              lastMessages: [{ key: { remoteJid: chat.id, id: "" } }]
-            },
-            chat.id
-          );
-          count++;
-        } catch (err) {}
-      }
-    }
-  } catch (e) {
-    console.error("[Reinigung] Fehler:", e.message);
+  for (const jid of knownChats) {
+    try {
+      await sock.chatModify(
+        {
+          delete: true,
+          lastMessages: [{ key: { remoteJid: jid, id: "" } }]
+        },
+        jid
+      );
+      count++;
+    } catch (err) {}
   }
 
   console.log(`[Reinigung] ${count} Chats auf Bot-Seite bereinigt.`);
@@ -346,7 +358,10 @@ async function startBot() {
       const isAdmin = ADMIN_NUMBER && senderNumber === ADMIN_NUMBER;
 
       if (senderJid && senderJid.endsWith("@s.whatsapp.net")) {
-        knownChats.add(senderJid);
+        if (!knownChats.has(senderJid)) {
+          knownChats.add(senderJid);
+          saveChatCache();
+        }
       }
 
       let text =
@@ -609,7 +624,10 @@ app.post("/send-message", async (req, res) => {
       return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
     }
 
-    knownChats.add(targetJid);
+    if (!knownChats.has(targetJid)) {
+      knownChats.add(targetJid);
+      saveChatCache();
+    }
     await sock.sendMessage(targetJid, { text: message });
     res.json({ success: true });
   } catch (err) {
@@ -633,7 +651,10 @@ app.post("/send-poll", async (req, res) => {
       return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
     }
 
-    knownChats.add(targetJid);
+    if (!knownChats.has(targetJid)) {
+      knownChats.add(targetJid);
+      saveChatCache();
+    }
     await sock.sendMessage(targetJid, {
       poll: {
         name: title,
