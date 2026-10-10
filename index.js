@@ -25,19 +25,15 @@ const WEBHOOK_PORT = process.env.PORT || 3000;
 // Admin-Nummer bereinigen (nur Ziffern)
 const ADMIN_NUMBER = process.env.ADMIN_NUMBER ? process.env.ADMIN_NUMBER.replace(/[^0-9]/g, "") : "";
 
-// Dynamische Laufzeit-Variablen (können vom Admin per Chat geändert werden)
+// Dynamische Laufzeit-Variablen
 let currentAgent = process.env.CONVERSATION_AGENT || null;
 let currentStt = process.env.STT_ENGINE || null;
 let currentTts = process.env.TTS_ENGINE || null;
 
-// -------------------------------------------------------------
-// Bekannte Chats für die automatische Reinigung speichern
-// -------------------------------------------------------------
+// Bekannte Chats für die automatische Reinigung
 const knownChats = new Set();
 
-// -------------------------------------------------------------
-// Parsing der ALLOWED_USERS (Format: Nummer:Name,Nummer:Name)
-// -------------------------------------------------------------
+// Parsing der ALLOWED_USERS
 const ALLOWED_USERS = []; 
 const ADDRESS_BOOK = {};  
 const NUMBER_TO_NAME = {};
@@ -59,14 +55,11 @@ if (process.env.ALLOWED_USERS) {
   });
 }
 
-// Falls Admin-Nummer definiert ist, sicherstellen dass sie erlaubt ist
 if (ADMIN_NUMBER && !ALLOWED_USERS.includes(ADMIN_NUMBER)) {
   ALLOWED_USERS.push(ADMIN_NUMBER);
 }
 
-// -------------------------------------------------------------
 // Persistent LID-Cache System
-// -------------------------------------------------------------
 const LID_CACHE_FILE = path.join(__dirname, "auth_info_baileys", "lid_cache.json");
 const autoLidMap = {};
 
@@ -107,11 +100,12 @@ const msgRetryCounterCache = new NodeCache();
 let sock;
 
 /**
- * Automatisches Löschen aller bekannten Bot-Chats einmal am Tag
+ * Automatisches oder manuelles Löschen aller bekannten Bot-Chats
  */
 async function cleanupOldChats() {
   if (!sock) return;
-  console.log("[Tägliche Reinigung] Starte das Aufräumen der Bot-Chats...");
+  console.log("[Reinigung] Starte das Aufräumen der Bot-Chats...");
+  let count = 0;
   for (const jid of knownChats) {
     try {
       await sock.chatModify(
@@ -121,10 +115,27 @@ async function cleanupOldChats() {
         },
         jid
       );
-      console.log(`[Tägliche Reinigung] Chat gelöscht auf Bot-Seite: ${jid}`);
+      count++;
     } catch (err) {}
   }
-  console.log("[Tägliche Reinigung] Chat-Bereinigung abgeschlossen!");
+  console.log(`[Reinigung] ${count} Chats auf Bot-Seite bereinigt.`);
+  return count;
+}
+
+/**
+ * Hilfsfunktion zum Abrufen von verfügbaren Conversation Agents aus Home Assistant
+ */
+async function fetchAvailableAgents() {
+  try {
+    const res = await axios.get(`${HA_URL}/api/states`, {
+      headers: { Authorization: `Bearer ${HA_TOKEN}` }
+    });
+    return res.data
+      .filter(e => e.entity_id.startsWith("conversation."))
+      .map(e => `• \`${e.entity_id}\` (${e.attributes.friendly_name || e.entity_id})`);
+  } catch (e) {
+    return ["Fehler beim Abrufen der Agenten aus Home Assistant."];
+  }
 }
 
 function resolveTargetJid(recipient) {
@@ -384,9 +395,10 @@ async function startBot() {
         if (isAdmin) {
           helpMsg += 
             "\n\n👑 *Admin-Befehle:*\n" +
-            "• `/setagent <id>` - Ändert den HA Agent\n" +
-            "• `/settts <id>` - Ändert die TTS Engine\n" +
-            "• `/setstt <id>` - Ändert die STT Engine\n" +
+            "• `/setagent [id]` - Agent setzen oder alle anzeigen\n" +
+            "• `/settts [id]` - TTS-Engine setzen oder anzeigen\n" +
+            "• `/setstt [id]` - STT-Engine setzen oder anzeigen\n" +
+            "• `/clean` - Löscht alle Chats auf Bot-Seite\n" +
             "• `/restart` - Startet den Bot neu";
         }
 
@@ -418,34 +430,70 @@ async function startBot() {
         continue;
       }
 
-      // --- NUR ADMIN BEFEHLE ---
-      if (cleanCmd.startsWith("/setagent ")) {
+      // --- ADMIN: CHATS BEREINIGEN ---
+      if (cleanCmd === "/clean" || cleanCmd === "/deletechats") {
         if (!isAdmin) {
           await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
           continue;
         }
-        currentAgent = text.replace("/setagent", "").trim();
-        await sock.sendMessage(senderJid, { text: `✅ Konversations-Agent geändert zu:\n\`${currentAgent}\`` });
+        await sock.sendMessage(senderJid, { text: "🧹 Räume alle Chats auf der Bot-Seite auf..." });
+        const clearedCount = await cleanupOldChats();
+        await sock.sendMessage(senderJid, { text: `✅ Fertig! ${clearedCount} Chats wurden auf der Bot-Seite geleert.` });
         continue;
       }
 
-      if (cleanCmd.startsWith("/settts ")) {
+      // --- ADMIN: AGENT SETZEN ODER AUFLISTEN ---
+      if (cleanCmd.startsWith("/setagent")) {
         if (!isAdmin) {
           await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
           continue;
         }
-        currentTts = text.replace("/settts", "").trim();
-        await sock.sendMessage(senderJid, { text: `✅ TTS-Engine geändert zu:\n\`${currentTts}\`` });
+        const newAgent = text.replace("/setagent", "").trim();
+        if (!newAgent) {
+          const agents = await fetchAvailableAgents();
+          await sock.sendMessage(senderJid, {
+            text: `🤖 *Verfügbare Conversation Agents in HA:*\nAktuell aktiv: \`${currentAgent || "Default"}\`\n\n` + agents.join("\n") + `\n\nNutze: \`/setagent <entity_id>\``
+          });
+        } else {
+          currentAgent = newAgent;
+          await sock.sendMessage(senderJid, { text: `✅ Konversations-Agent geändert zu:\n\`${currentAgent}\`` });
+        }
         continue;
       }
 
-      if (cleanCmd.startsWith("/setstt ")) {
+      // --- ADMIN: TTS ENGINE SETZEN ODER AUFLISTEN ---
+      if (cleanCmd.startsWith("/settts")) {
         if (!isAdmin) {
           await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
           continue;
         }
-        currentStt = text.replace("/setstt", "").trim();
-        await sock.sendMessage(senderJid, { text: `✅ STT-Engine geändert zu:\n\`${currentStt}\`` });
+        const newTts = text.replace("/settts", "").trim();
+        if (!newTts) {
+          await sock.sendMessage(senderJid, {
+            text: `🗣️ *TTS Engine*\nAktuell aktiv: \`${currentTts || "Nicht aktiv"}\`\n\nGib den Namen der Engine ein (z. B. \`/settts tts.piper\` oder \`/settts google_translate_say\`).`
+          });
+        } else {
+          currentTts = newTts;
+          await sock.sendMessage(senderJid, { text: `✅ TTS-Engine geändert zu:\n\`${currentTts}\`` });
+        }
+        continue;
+      }
+
+      // --- ADMIN: STT ENGINE SETZEN ODER AUFLISTEN ---
+      if (cleanCmd.startsWith("/setstt")) {
+        if (!isAdmin) {
+          await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
+          continue;
+        }
+        const newStt = text.replace("/setstt", "").trim();
+        if (!newStt) {
+          await sock.sendMessage(senderJid, {
+            text: `🎙️ *STT Engine*\nAktuell aktiv: \`${currentStt || "Nicht aktiv"}\`\n\nGib den Namen der Engine ein (z. B. \`/setstt stt.faster_whisper\`).`
+          });
+        } else {
+          currentStt = newStt;
+          await sock.sendMessage(senderJid, { text: `✅ STT-Engine geändert zu:\n\`${currentStt}\`` });
+        }
         continue;
       }
 
