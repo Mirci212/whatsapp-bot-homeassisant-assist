@@ -120,7 +120,7 @@ Um den Webhook direkt aus Home Assistant-Automatisierungen aufzurufen, füge fol
 ```yaml
 rest_command:
   send_whatsapp:
-    url: "[http://192.168.0.](http://192.168.0.)x:3000/send-message"
+    url: "http://192.168.0.x:3000/send-message"
     method: POST
     headers:
       content-type: "application/json"
