@@ -3,6 +3,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
+  makeInMemoryStore,
 } = require("@whiskeysockets/baileys");
 const axios = require("axios");
 const qrcode = require("qrcode-terminal");
@@ -24,6 +25,15 @@ const CONVERSATION_AGENT = process.env.CONVERSATION_AGENT || null;
 const STT_ENGINE = process.env.STT_ENGINE || null; 
 const TTS_ENGINE = process.env.TTS_ENGINE || null; 
 const WEBHOOK_PORT = process.env.PORT || 3000;
+
+// -------------------------------------------------------------
+// Baileys Store für Chat-Verwaltung initialisieren
+// -------------------------------------------------------------
+const store = makeInMemoryStore({});
+store.readFromFile("./auth_info_baileys/baileys_store.json");
+setInterval(() => {
+  store.writeToFile("./auth_info_baileys/baileys_store.json");
+}, 10_000);
 
 // -------------------------------------------------------------
 // Parsing der ALLOWED_USERS (Format: Nummer:Name,Nummer:Name)
@@ -92,8 +102,48 @@ const msgRetryCounterCache = new NodeCache();
 let sock;
 
 /**
- * Wandelt Text via Home Assistant TTS direkt in eine Audio-URL um (Behebt den 400 Bad Request Fehler)
+ * Automatisches Löschen aller Bot-Chats einmal am Tag
  */
+async function cleanupOldChats() {
+  if (!sock) return;
+  console.log("[Tägliche Reinigung] Starte das Aufräumen der Bot-Chats...");
+  try {
+    const chats = store.chats.all();
+    for (const chat of chats) {
+      try {
+        await sock.chatModify(
+          {
+            delete: true,
+            lastMessages: [{ key: { remoteJid: chat.id, id: "" } }]
+          },
+          chat.id
+        );
+        console.log(`[Tägliche Reinigung] Chat gelöscht auf Bot-Seite: ${chat.id}`);
+      } catch (err) {
+        // Einzelne Fehler ignorieren (z.B. falls Chat schon leer ist)
+      }
+    }
+    console.log("[Tägliche Reinigung] Chat-Bereinigung abgeschlossen!");
+  } catch (error) {
+    console.error("[Tägliche Reinigung] Fehler beim Löschen der Chats:", error.message);
+  }
+}
+
+function resolveTargetJid(recipient) {
+  const cleanRecipient = recipient.toLowerCase().trim();
+  let targetNumber = ADDRESS_BOOK[cleanRecipient];
+
+  if (!targetNumber) {
+    const isNumeric = /^\+?\d+$/.test(cleanRecipient);
+    if (isNumeric) {
+      targetNumber = cleanRecipient.replace("+", "").trim();
+    } else {
+      return null;
+    }
+  }
+  return `${targetNumber}@s.whatsapp.net`;
+}
+
 async function textToSpeech(text) {
   if (!TTS_ENGINE) return null;
 
@@ -122,9 +172,6 @@ async function textToSpeech(text) {
   return null;
 }
 
-/**
- * Sendet Sprachnachrichten an den Home Assistant STT Endpoint (Whisper)
- */
 async function transcribeAudio(msg) {
   if (!STT_ENGINE) {
     console.error("[HA STT] Keine STT_ENGINE in .env konfiguriert.");
@@ -175,9 +222,7 @@ async function transcribeAudio(msg) {
     try {
       if (fs.existsSync(tmpOggPath)) fs.unlinkSync(tmpOggPath);
       if (fs.existsSync(tmpWavPath)) fs.unlinkSync(tmpWavPath);
-    } catch (e) {
-      // Aufräumfehler ignorieren
-    }
+    } catch (e) {}
   }
 }
 
@@ -235,6 +280,7 @@ async function startBot() {
     syncFullHistory: true,
   });
 
+  store.bind(sock.ev);
   sock.ev.on("creds.update", saveCreds);
 
   const handleContacts = (contacts) => {
@@ -264,6 +310,12 @@ async function startBot() {
         registerLidMapping(sock.user.lid, sock.user.id);
       }
       console.log("WhatsApp Bot ist erfolgreich verbunden!");
+
+      // Startet die Reinigung einmal täglich (alle 24 Stunden)
+      setInterval(cleanupOldChats, 24 * 60 * 60 * 1000);
+      
+      // Führt nach 1 Minute beim Start zusätzlich eine Reinigung durch
+      setTimeout(cleanupOldChats, 60_000);
     }
   });
 
@@ -282,13 +334,6 @@ async function startBot() {
         msg.message?.videoMessage?.caption ||
         msg.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
-
-      if (msg.message?.pollUpdateMessage) {
-        const selectedOptions = msg.message.pollUpdateMessage.vote?.selectedOptions;
-        if (selectedOptions && selectedOptions.length > 0) {
-          text = selectedOptions[0];
-        }
-      }
 
       const isAudio = Boolean(msg.message?.audioMessage);
       if (!text && isAudio) {
@@ -310,8 +355,16 @@ async function startBot() {
         continue;
       }
 
-      const cleanCmd = text.trim().toLowerCase();
+      let cleanCmd = text.trim().toLowerCase();
 
+      // Schnell-Zahlen aus dem Menü
+      if (cleanCmd === "1") cleanCmd = "!reset";
+      if (cleanCmd === "2") cleanCmd = "/status";
+      if (cleanCmd === "3") cleanCmd = "/help";
+
+      // ---------------------------------------------------------
+      // STEUERBEFEHLE & MENÜS
+      // ---------------------------------------------------------
       if (cleanCmd === "!reset" || cleanCmd === "/reset" || cleanCmd === "cmd_reset" || cleanCmd.includes("verlauf zurücksetzen")) {
         delete userConversations[senderNumber];
         await sock.sendMessage(senderJid, {
@@ -325,9 +378,9 @@ async function startBot() {
           "🤖 *Home Assistant WhatsApp-Bot*\n\n" +
           "• *Steuerung:* Schreibe oder sprich einfache Sprachbefehle.\n" +
           "• `/menu` - Öffnet das interaktive Auswahlmenü.\n" +
-          "• `!reset` - Setzt den aktuellen Gesprächsverlauf zurück.\n" +
-          "• `/status` - Zeigt System-Informationen an.\n" +
-          "• `/help` - Zeigt diese Hilfe an.";
+          "• `1` oder `!reset` - Setzt den Gesprächsverlauf zurück.\n" +
+          "• `2` oder `/status` - Zeigt System-Informationen an.\n" +
+          "• `3` oder `/help` - Zeigt diese Hilfe an.";
         await sock.sendMessage(senderJid, { text: helpMsg });
         continue;
       }
@@ -345,17 +398,13 @@ async function startBot() {
       }
 
       if (cleanCmd === "/menu") {
-        await sock.sendMessage(senderJid, {
-          poll: {
-            name: "🤖 Hauptmenü — Bitte eine Option wählen:",
-            values: [
-              "🔄 Verlauf zurücksetzen",
-              "ℹ️ System Status",
-              "❓ Hilfe"
-            ],
-            selectableCount: 1
-          }
-        });
+        const menuMsg =
+          "🤖 *Hauptmenü*\n\n" +
+          "Wähle eine Option (einfach Zahl senden):\n\n" +
+          "1️⃣ *Verlauf zurücksetzen*\n" +
+          "2️⃣ *System Status*\n" +
+          "3️⃣ *Hilfe anzeigen*";
+        await sock.sendMessage(senderJid, { text: menuMsg });
         continue;
       }
 
@@ -419,6 +468,9 @@ async function startBot() {
   });
 }
 
+// -------------------------------------------------------------
+// WEBHOOK-SERVER (Home Assistant -> WhatsApp)
+// -------------------------------------------------------------
 const app = express();
 app.use(express.json());
 
@@ -430,26 +482,45 @@ app.post("/send-message", async (req, res) => {
   if (!recipient) return res.status(400).json({ error: "Kein Empfänger angegeben." });
 
   try {
-    const cleanRecipient = recipient.toLowerCase().trim();
-    let targetNumber = ADDRESS_BOOK[cleanRecipient];
-
-    if (!targetNumber) {
-      const isNumeric = /^\+?\d+$/.test(cleanRecipient);
-      if (isNumeric) {
-        targetNumber = cleanRecipient.replace("+", "").trim();
-      } else {
-        return res.status(404).json({
-          error: `Name oder Nummer "${recipient}" wurde in ALLOWED_USERS nicht gefunden.`,
-        });
-      }
+    const targetJid = resolveTargetJid(recipient);
+    if (!targetJid) {
+      return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
     }
 
-    const targetJid = `${targetNumber}@s.whatsapp.net`;
     await sock.sendMessage(targetJid, { text: message });
-
     res.json({ success: true });
   } catch (err) {
     console.error("Fehler beim Senden via Webhook:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/send-poll", async (req, res) => {
+  const { title, options, recipient } = req.body;
+
+  if (!title || !options || !Array.isArray(options)) {
+    return res.status(400).json({ error: "Titel und ein Array von 'options' sind erforderlich." });
+  }
+  if (!sock) return res.status(503).json({ error: "WhatsApp Bot ist noch nicht verbunden." });
+  if (!recipient) return res.status(400).json({ error: "Kein Empfänger angegeben." });
+
+  try {
+    const targetJid = resolveTargetJid(recipient);
+    if (!targetJid) {
+      return res.status(404).json({ error: `Empfänger "${recipient}" nicht gefunden.` });
+    }
+
+    await sock.sendMessage(targetJid, {
+      poll: {
+        name: title,
+        values: options,
+        selectableCount: 1
+      }
+    });
+
+    res.json({ success: true, message: "Umfrage erfolgreich gesendet." });
+  } catch (err) {
+    console.error("Fehler beim Senden der Umfrage via API:", err);
     res.status(500).json({ error: err.message });
   }
 });
