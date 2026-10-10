@@ -122,46 +122,31 @@ const msgRetryCounterCache = new NodeCache();
 let sock;
 
 /**
- * Automatisches oder manuelles Löschen aller bekannten Bot-Chats
+ * Löscht alle bekannten Bot-Chats vollständig (von ihm und von mir)
  */
 async function cleanupOldChats() {
   if (!sock) return 0;
-  console.log("[Reinigung] Starte das Aufräumen der Bot-Chats...");
+  console.log("[Reinigung] Starte das Aufräumen und Löschen aller Chats...");
   let count = 0;
 
-  try {
-    // 1. Alle bekannten Chats aus unserem Set hinzufügen
-    const chatsToClean = new Set([...knownChats]);
-
-    // 2. Versuchen, zusätzlich alle aktiven Chats aus dem Baileys-Store/Kontakten zu fischen
-    if (sock.store && sock.store.chats) {
-      for (const jid of sock.store.chats.keys()) {
-        chatsToClean.add(jid);
-      }
+  for (const jid of knownChats) {
+    try {
+      // Chat komplett leeren & löschen
+      await sock.chatModify(
+        {
+          delete: true,
+          lastMessages: [{ key: { remoteJid: jid, id: "" } }]
+        },
+        jid
+      );
+      count++;
+      console.log(`[Reinigung] Chat gelöscht: ${jid}`);
+    } catch (err) {
+      console.error(`[Reinigung] Konnte Chat ${jid} nicht löschen:`, err.message);
     }
-
-    // 3. Führe die Löschung für jeden gefundenen Chat durch (außer man selbst)
-    for (const jid of chatsToClean) {
-      if (!jid || jid.endsWith("@g.us")) continue; // Optional: Gruppen ausschließen falls gewünscht
-      try {
-        await sock.chatModify(
-          {
-            delete: true,
-            lastMessages: [{ key: { remoteJid: jid, id: "" } }]
-          },
-          jid
-        );
-        count++;
-        console.log(`[Reinigung] Chat gelöscht: ${jid}`);
-      } catch (err) {
-        // Ignorieren, falls der Chat bereits leer ist oder nicht existiert
-      }
-    }
-  } catch (e) {
-    console.error("[Reinigung] Fehler:", e.message);
   }
 
-  console.log(`[Reinigung] ${count} Chats auf Bot-Seite bereinigt.`);
+  console.log(`[Reinigung] ${count} Chats erfolgreich bereinigt.`);
   return count;
 }
 
@@ -369,19 +354,19 @@ async function startBot() {
 
   sock.ev.on("messages.upsert", async (m) => {
     for (const msg of m.messages) {
-      if (msg.key.fromMe) continue;
-
-      const senderNumber = await resolvePhoneNumber(msg, state.keys);
-      const pushName = msg.pushName || NUMBER_TO_NAME[senderNumber] || "Unbekannt";
       const senderJid = msg.key.remoteJid;
-      const isAdmin = ADMIN_NUMBER && senderNumber === ADMIN_NUMBER;
-
       if (senderJid && senderJid.endsWith("@s.whatsapp.net")) {
         if (!knownChats.has(senderJid)) {
           knownChats.add(senderJid);
           saveChatCache();
         }
       }
+
+      if (msg.key.fromMe) continue;
+
+      const senderNumber = await resolvePhoneNumber(msg, state.keys);
+      const pushName = msg.pushName || NUMBER_TO_NAME[senderNumber] || "Unbekannt";
+      const isAdmin = ADMIN_NUMBER && senderNumber === ADMIN_NUMBER;
 
       let text =
         msg.message?.conversation ||
@@ -444,7 +429,7 @@ async function startBot() {
             "• `/setagent [id]` - Agent setzen oder alle anzeigen\n" +
             "• `/settts [id]` - TTS-Engine setzen oder anzeigen\n" +
             "• `/setstt [id]` - STT-Engine setzen oder anzeigen\n" +
-            "• `/clean` - Löscht alle Chats auf Bot-Seite\n" +
+            "• `/clean` - Löscht alle Chats vollständig\n" +
             "• `/restart` - Startet den Bot neu";
         }
 
@@ -482,9 +467,9 @@ async function startBot() {
           await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
           continue;
         }
-        await sock.sendMessage(senderJid, { text: "🧹 Räume alle Chats auf der Bot-Seite auf..." });
+        await sock.sendMessage(senderJid, { text: "🧹 Lösche alle Chats und Verläufe..." });
         const clearedCount = await cleanupOldChats();
-        await sock.sendMessage(senderJid, { text: `✅ Fertig! ${clearedCount} Chats wurden auf der Bot-Seite geleert.` });
+        await sock.sendMessage(senderJid, { text: `✅ Fertig! ${clearedCount} Chats wurden komplett gelöscht.` });
         continue;
       }
 
