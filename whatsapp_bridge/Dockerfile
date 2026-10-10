@@ -1,14 +1,13 @@
 FROM node:20-alpine
 
-RUN apk add --no-cache ffmpeg
+# Git und Build-Tools für npm-Abhängigkeiten installieren, plus FFmpeg für Audio
+RUN apk add --no-cache ffmpeg git python3 make g++
 
 WORKDIR /app
 
-# Hier nur gezielt die package.json kopieren
 COPY package.json ./
 RUN npm install
 
-# Rest des Codes kopieren
 COPY . .
 
 RUN chmod +x /app/run.sh
