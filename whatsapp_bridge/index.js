@@ -121,33 +121,89 @@ const userConversations = {};
 const msgRetryCounterCache = new NodeCache();
 let sock;
 
+// Letzte bekannte Nachricht pro Chat (für chatModify delete nötig).
+// Baileys verlangt echte key.id + messageTimestamp, kein ""-Platzhalter.
+const lastMessageCache = new Map();
+
+function trackChatMessage(jid, msg) {
+  if (!jid || !msg?.key?.id || !msg.messageTimestamp) return;
+  if (jid === "status@broadcast") return;
+  lastMessageCache.set(jid, {
+    key: {
+      remoteJid: msg.key.remoteJid || jid,
+      id: msg.key.id,
+      fromMe: Boolean(msg.key.fromMe),
+      ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+    },
+    messageTimestamp: msg.messageTimestamp,
+  });
+  if (!knownChats.has(jid)) {
+    knownChats.add(jid);
+    saveChatCache();
+  }
+}
+
+function isTrackableChatJid(jid) {
+  if (!jid || typeof jid !== "string") return false;
+  return (
+    jid.endsWith("@s.whatsapp.net") ||
+    jid.endsWith("@lid") ||
+    jid.endsWith("@g.us")
+  );
+}
+
 /**
- * Löscht alle bekannten Bot-Chats vollständig (von ihm und von mir)
+ * Löscht alle bekannten Bot-Chats vollständig (nur auf Bot-Seite!
+ * "Für alle löschen" geht via Baileys nicht für ganze Chats).
  */
 async function cleanupOldChats() {
-  if (!sock) return 0;
+  if (!sock) return { cleared: 0, failed: 0, details: [] };
   console.log("[Reinigung] Starte das Aufräumen und Löschen aller Chats...");
-  let count = 0;
+  let cleared = 0;
+  let failed = 0;
+  const details = [];
+  const done = [];
 
-  for (const jid of knownChats) {
+  for (const jid of [...knownChats]) {
     try {
-      // Chat komplett leeren & löschen
-      await sock.chatModify(
-        {
-          delete: true,
-          lastMessages: [{ key: { remoteJid: jid, id: "" } }]
-        },
-        jid
-      );
-      count++;
-      console.log(`[Reinigung] Chat gelöscht: ${jid}`);
+      // 1. Verlauf auf Bot-Seite leeren (braucht keine lastMessages in v6.7.x)
+      try {
+        await sock.chatModify({ clear: true }, jid);
+      } catch (clearErr) {
+        console.warn(`[Reinigung] Clear für ${jid} fehlgeschlagen:`, clearErr.message);
+      }
+
+      // 2. Chat aus der Chatliste entfernen (braucht ECHTE letzte Nachricht)
+      const lastMsg = lastMessageCache.get(jid);
+      if (lastMsg?.key?.id && lastMsg.messageTimestamp) {
+        await sock.chatModify(
+          { delete: true, lastMessages: [lastMsg] },
+          jid
+        );
+      } else {
+        // Ohne bekannte Nachricht kann WhatsApp den Delete nicht abgleichen:
+        // dann bleibt nur Clear übrig, das ist kein Fehler von chatModify.
+        console.warn(`[Reinigung] Keine letzte Nachricht für ${jid} bekannt, nur Verlauf geleert.`);
+      }
+
+      done.push(jid);
+      lastMessageCache.delete(jid);
+      cleared++;
+      console.log(`[Reinigung] Chat bereinigt: ${jid}`);
+      details.push(`✅ ${jid}`);
     } catch (err) {
+      failed++;
       console.error(`[Reinigung] Konnte Chat ${jid} nicht löschen:`, err.message);
+      details.push(`❌ ${jid}: ${err.message}`);
     }
   }
 
-  console.log(`[Reinigung] ${count} Chats erfolgreich bereinigt.`);
-  return count;
+  // Erfolgreich bereinigte Chats aus dem Cache entfernen, damit die Liste nicht ewig wächst
+  for (const jid of done) knownChats.delete(jid);
+  if (done.length) saveChatCache();
+
+  console.log(`[Reinigung] ${cleared} Chats bereinigt, ${failed} Fehler.`);
+  return { cleared, failed, details };
 }
 
 /**
@@ -347,19 +403,43 @@ async function startBot() {
       }
       console.log("WhatsApp Bot ist erfolgreich verbunden!");
 
-      setInterval(cleanupOldChats, 24 * 60 * 60 * 1000);
-      setTimeout(cleanupOldChats, 60_000);
+      // Timer nur einmal anlegen (sonst bei jedem Reconnect ein weiterer Interval)
+      if (!global.__waCleanupTimer) {
+        global.__waCleanupTimer = setInterval(cleanupOldChats, 24 * 60 * 60 * 1000);
+        setTimeout(cleanupOldChats, 60_000);
+      }
     }
+  });
+
+  // Eigene gesendete Nachrichten mittracken (für späteren Delete nötig)
+  const origSendMessage = sock.sendMessage.bind(sock);
+  sock.sendMessage = async (jid, content, options) => {
+    const sent = await origSendMessage(jid, content, options);
+    if (sent?.key?.id && isTrackableChatJid(jid)) {
+      trackChatMessage(jid, sent);
+    }
+    return sent;
+  };
+
+  // Historie beim Connect mitnehmen, damit /clean auch alte Chats kennt
+  sock.ev.on("messaging-history.set", ({ chats, messages }) => {
+    for (const c of chats || []) {
+      if (isTrackableChatJid(c.id) && !knownChats.has(c.id)) {
+        knownChats.add(c.id);
+      }
+    }
+    for (const m of messages || []) {
+      const jid = m.key?.remoteJid;
+      if (isTrackableChatJid(jid)) trackChatMessage(jid, m);
+    }
+    saveChatCache();
   });
 
   sock.ev.on("messages.upsert", async (m) => {
     for (const msg of m.messages) {
       const senderJid = msg.key.remoteJid;
-      if (senderJid && senderJid.endsWith("@s.whatsapp.net")) {
-        if (!knownChats.has(senderJid)) {
-          knownChats.add(senderJid);
-          saveChatCache();
-        }
+      if (isTrackableChatJid(senderJid)) {
+        trackChatMessage(senderJid, msg);
       }
 
       if (msg.key.fromMe) continue;
@@ -467,9 +547,18 @@ async function startBot() {
           await sock.sendMessage(senderJid, { text: "❌ Dieser Befehl ist nur dem Administrator vorbehalten." });
           continue;
         }
-        await sock.sendMessage(senderJid, { text: "🧹 Lösche alle Chats und Verläufe..." });
-        const clearedCount = await cleanupOldChats();
-        await sock.sendMessage(senderJid, { text: `✅ Fertig! ${clearedCount} Chats wurden komplett gelöscht.` });
+        await sock.sendMessage(senderJid, { text: "🧹 Lösche alle Chats und Verläufe (nur auf Bot-Seite, nicht bei den Kontakten)..." });
+        const result = await cleanupOldChats();
+        let reply = `✅ Fertig! ${result.cleared} Chats bereinigt`;
+        if (result.failed) reply += `, ${result.failed} Fehler`;
+        reply += ".";
+        if (result.details?.length) {
+          const short = result.details.slice(0, 20).join("\n");
+          reply += `\n\n${short}`;
+          if (result.details.length > 20) reply += `\n… +${result.details.length - 20} weitere`;
+        }
+        reply += "\n\nℹ️ Hinweis: WhatsApp erlaubt kein Löschen beim Kontakt – dort bleibt der Verlauf sichtbar.";
+        await sock.sendMessage(senderJid, { text: reply });
         continue;
       }
 
