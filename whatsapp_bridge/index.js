@@ -103,21 +103,32 @@ let sock;
  * Automatisches oder manuelles Löschen aller bekannten Bot-Chats
  */
 async function cleanupOldChats() {
-  if (!sock) return;
+  if (!sock) return 0;
   console.log("[Reinigung] Starte das Aufräumen der Bot-Chats...");
   let count = 0;
-  for (const jid of knownChats) {
-    try {
-      await sock.chatModify(
-        {
-          delete: true,
-          lastMessages: [{ key: { remoteJid: jid, id: "" } }]
-        },
-        jid
-      );
-      count++;
-    } catch (err) {}
+
+  try {
+    // Holt alle aktiven Chats direkt aus der Socket-Verbindung
+    const chats = sock.chats ? sock.chats.all() : [];
+    
+    for (const chat of chats) {
+      if (chat.id && chat.id.endsWith("@s.whatsapp.net")) {
+        try {
+          await sock.chatModify(
+            {
+              delete: true,
+              lastMessages: [{ key: { remoteJid: chat.id, id: "" } }]
+            },
+            chat.id
+          );
+          count++;
+        } catch (err) {}
+      }
+    }
+  } catch (e) {
+    console.error("[Reinigung] Fehler beim Durchlaufen der Chats:", e.message);
   }
+
   console.log(`[Reinigung] ${count} Chats auf Bot-Seite bereinigt.`);
   return count;
 }
